@@ -43,11 +43,15 @@ Notes
 
 import io
 import os
+import logging
 from pathlib import Path
 from typing import List, Tuple
 
 
 import streamlit as st
+
+# Suppress Streamlit ScriptRunContext warnings from multiprocessing workers
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 
 # Try to import the vectormap modules. Provide a clear error if missing.
 try:
