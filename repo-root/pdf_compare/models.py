@@ -1,16 +1,61 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Literal
-from dataclasses import asdict
+from enum import Enum, auto
+from typing import List, Tuple, Optional, Dict, Literal
 
-BBox = Tuple[float, float, float, float]  # keep your alias
+# --------------------------------------------------------------------
+# Shared alias
+# --------------------------------------------------------------------
+BBox = Tuple[float, float, float, float]  # x0,y0,x1,y1 in PDF user space
 
-# --- Diff payload models (what overlay.py consumes) ---
+# --------------------------------------------------------------------
+# Ingest / storage models (used by pdf_extract, store, etc.)
+# --------------------------------------------------------------------
+class GeoKind(Enum):
+    STROKE = auto()
+    FILL = auto()
+
+@dataclass(frozen=True)
+class VectorGeom:
+    kind: GeoKind
+    wkb: bytes           # shapely geometry serialized as WKB
+    bbox: BBox
+
+@dataclass(frozen=True)
+class TextRun:
+    text: str
+    bbox: BBox
+    font: Optional[str]
+    size: Optional[float]
+
+@dataclass(frozen=True)
+class PageVectors:
+    page_number: int     # 1-based
+    width: float
+    height: float
+    rotation: int        # 0/90/180/270
+    geoms: List[VectorGeom]
+    texts: List[TextRun]
+
+@dataclass(frozen=True)
+class DocMeta:
+    doc_id: str          # stable id (hash of content or provided)
+    path: str
+    page_count: int
+
+@dataclass(frozen=True)
+class VectorMap:
+    meta: DocMeta
+    pages: List[PageVectors]
+
+# --------------------------------------------------------------------
+# Diff payload models (consumed by overlay.py, UI) – additive
+# --------------------------------------------------------------------
 @dataclass(frozen=True)
 class GeometryDiff:
     added: List[BBox] = field(default_factory=list)
     removed: List[BBox] = field(default_factory=list)
-    changed: List[BBox] = field(default_factory=list)   # for raster-grid diffs
+    changed: List[BBox] = field(default_factory=list)   # for raster/grid diffs
 
 @dataclass(frozen=True)
 class TextAdd:
@@ -45,6 +90,9 @@ class RasterGridConfig:
     method: str = "hybrid"            # or "ssim"
     merge_adjacent: bool = True
 
+# --------------------------------------------------------------------
+# Helpers to convert between typed PageDiff and overlay.py dicts
+# --------------------------------------------------------------------
 def page_diff_from_dict(d: dict) -> PageDiff:
     g = d.get("geometry", {})
     t = d.get("text", {})
@@ -66,7 +114,6 @@ def page_diff_from_dict(d: dict) -> PageDiff:
     )
 
 def page_diff_to_overlay_dict(pd: PageDiff) -> dict:
-    """Convert a typed PageDiff into the dict structure overlay.py expects."""
     return {
         "page": pd.page,
         "geometry": {
@@ -84,5 +131,14 @@ def page_diff_to_overlay_dict(pd: PageDiff) -> dict:
         },
     }
 
-def diffs_to_overlay_dicts(pages: list[PageDiff]) -> list[dict]:
+def diffs_to_overlay_dicts(pages: List[PageDiff]) -> List[dict]:
     return [page_diff_to_overlay_dict(p) for p in pages]
+
+__all__ = [
+    # ingest/storage
+    "BBox", "GeoKind", "VectorGeom", "TextRun", "PageVectors", "DocMeta", "VectorMap",
+    # diff/config
+    "GeometryDiff", "TextAdd", "TextMoved", "TextDiff", "PageDiff", "RasterGridConfig",
+    # helpers
+    "page_diff_from_dict", "page_diff_to_overlay_dict", "diffs_to_overlay_dicts",
+]
