@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  # Single-user deployment: UI + processing on same container
+  pdf-compare-standalone:
+    build: .
+    container_name: pdf-compare-standalone
+    ports:
+      - "8501:8501"
+    volumes:
+      # Persist database and uploads
+      - ./data/db:/app/data/db
+      - ./data/uploads:/app/data/uploads
+      - ./data/outputs:/app/data/outputs
+    environment:
+      - CPU_LIMIT=4
+      - PDF_MIN_SEGMENT_LEN=0.50
+      - PDF_MIN_FILL_AREA=0.50
+      - PDF_BEZIER_SAMPLES=24
+    restart: unless-stopped
+    cpus: 4
+    mem_limit: 4g
+
+  # Multi-user deployment: Separate UI and worker containers
+  pdf-compare-ui:
+    build: .
+    container_name: pdf-compare-ui
+    profiles: ["multi-user"]
+    ports:
+      - "8501:8501"
+    volumes:
+      - shared-data:/app/data
+    environment:
+      - CPU_LIMIT=1  # UI only needs minimal CPU
+      - DB_PATH=/app/data/db/vectormap.sqlite
+    restart: unless-stopped
+    command: streamlit run ui/streamlit_app.py --server.address 0.0.0.0 --server.port 8501
+    depends_on:
+      - pdf-compare-worker
+    cpus: 1
+    mem_limit: 1g
+
+  pdf-compare-worker:
+    build: .
+    container_name: pdf-compare-worker
+    profiles: ["multi-user"]
+    volumes:
+      - shared-data:/app/data
+    environment:
+      - CPU_LIMIT=8  # Use all available cores for processing
+      - PDF_MIN_SEGMENT_LEN=0.50
+      - PDF_MIN_FILL_AREA=0.50
+      - PDF_BEZIER_SAMPLES=24
+    restart: unless-stopped
+    command: python -m pdf_compare.cli  # Placeholder - will need API server
+    cpus: 8
+    mem_limit: 8g
+
+volumes:
+  shared-data:
+
+networks:
+  default:
+    name: pdf-compare-network
