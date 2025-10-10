@@ -1,4 +1,3 @@
-# compare.py
 from __future__ import annotations
 from typing import List, Tuple, Dict
 import sqlite3
@@ -9,12 +8,17 @@ from shapely.wkb import loads as wkb_loads
 from shapely.strtree import STRtree
 from shapely.geometry.base import BaseGeometry
 from shapely.errors import GEOSException
-from .raster_diff import raster_diff_boxes
-# --- Enforce Shapely 2.x without extra deps
+
+try:
+    from .models import page_diff_from_dict, PageDiff  # type: ignore
+except Exception:
+    page_diff_from_dict = None
+    PageDiff = None  # type: ignore
+
 try:
     _major = int(shapely.__version__.split(".", 1)[0])
 except Exception:
-    _major = 2  # assume ok if version string is odd
+    _major = 2
 if _major < 2:
     raise RuntimeError(f"Shapely 2.x required; found {shapely.__version__}")
 
@@ -66,20 +70,17 @@ def _query_hits(tree: STRtree | None, gb: BaseGeometry, backing: List[BaseGeomet
     if not hits:
         return []
 
-    # If first element isn't a Shapely geometry, treat as indices and map
     first = hits[0]
     is_geom = hasattr(first, "geom_type") or isinstance(first, BaseGeometry)
     if not is_geom:
         out: List[BaseGeometry] = []
         for idx in hits:
-            ii = int(idx)                        # handles np.int64 cleanly
+            ii = int(idx)                        # handle np.int64
             if 0 <= ii < len(backing):
                 out.append(backing[ii])
         return out
 
-    # Already geometry objects
     return hits
-
 
 def _geom_matches(gb: BaseGeometry, candidates: List[BaseGeometry]) -> bool:
     """Return True if buffered geom `gb` matches any candidate within tolerance."""
@@ -89,29 +90,25 @@ def _geom_matches(gb: BaseGeometry, candidates: List[BaseGeometry]) -> bool:
         if h is None or h.is_empty:
             continue
         try:
-            # quick reject on envelopes
             if not gb.envelope.intersects(h.envelope):
                 continue
-            # robust overlap checks
             if gb.intersects(h):
                 sym = gb.symmetric_difference(h)
                 if sym.is_empty or sym.area < AREA_EPS:
                     return True
-            # near-equality fallback
             if gb.difference(h).area < AREA_EPS or h.difference(gb).area < AREA_EPS:
                 return True
         except GEOSException:
-            # Skip degenerate/invalid cases
             continue
     return False
 
 # -----------------------
-# Public API
+# Public API (dict-based)
 # -----------------------
 def diff_documents(conn: sqlite3.Connection, old_id: str, new_id: str, pages: List[int] | None = None):
     """
-    Compare two ingested documents page by page.
-    Returns a list of per-page diff dicts.
+    Compare two ingested documents page by page (vector + text).
+    Returns a list of per-page diff dicts compatible with overlay.py.
     """
     row_old = conn.execute("SELECT page_count FROM documents WHERE doc_id=?", (old_id,)).fetchone()
     row_new = conn.execute("SELECT page_count FROM documents WHERE doc_id=?", (new_id,)).fetchone()
@@ -125,21 +122,21 @@ def diff_documents(conn: sqlite3.Connection, old_id: str, new_id: str, pages: Li
     return [diff_pages(conn, old_id, new_id, p) for p in pages]
 
 def diff_pages(conn: sqlite3.Connection, old_id: str, new_id: str, page: int) -> Dict:
-    # ---------------- Load content ----------------
+    # Load content
     a_geoms = _load_page_geoms(conn, old_id, page)
     b_geoms = _load_page_geoms(conn, new_id, page)
     a_txt = _load_page_texts(conn, old_id, page)
     b_txt = _load_page_texts(conn, new_id, page)
 
-    # Early no-op: nothing on either side at all
+    # Early no-op
     if not a_geoms and not b_geoms and not a_txt and not b_txt:
         return {
             "page": page,
-            "geometry": {"added": [], "removed": []},
+            "geometry": {"added": [], "removed": [], "changed": []},
             "text": {"added": [], "removed": [], "moved": []},
         }
 
-    # ---------------- Geometry diff ----------------
+    # Geometry diff
     a_buf = [g.buffer(GEO_TOL) for g in a_geoms] if a_geoms else []
     b_buf = [g.buffer(GEO_TOL) for g in b_geoms] if b_geoms else []
 
@@ -148,25 +145,19 @@ def diff_pages(conn: sqlite3.Connection, old_id: str, new_id: str, page: int) ->
 
     removed_geo, added_geo = [], []
 
-    #    removed: A not in B
+    # removed: A not in B
     for g, gb in zip(a_geoms, a_buf):
-        hits = _query_hits(tree_b, gb, b_buf)  # backing = b_buf (tree_b was built on b_buf)
-        # Sanity check: after mapping, hits must be geometries
-        if hits and not (hasattr(hits[0], "geom_type") or isinstance(hits[0], BaseGeometry)):
-            raise RuntimeError(f"Non-geometry in hits after mapping (removed loop): {type(hits[0]).__name__}")
+        hits = _query_hits(tree_b, gb, b_buf)
         if not hits or not _geom_matches(gb, hits):
             removed_geo.append(g)
 
     # added: B not in A
     for g, gb in zip(b_geoms, b_buf):
-        hits = _query_hits(tree_a, gb, a_buf)  # backing = a_buf (tree_a was built on a_buf)
-        # Sanity check: after mapping, hits must be geometries
-        if hits and not (hasattr(hits[0], "geom_type") or isinstance(hits[0], BaseGeometry)):
-            raise RuntimeError(f"Non-geometry in hits after mapping (added loop): {type(hits[0]).__name__}")
+        hits = _query_hits(tree_a, gb, a_buf)
         if not hits or not _geom_matches(gb, hits):
             added_geo.append(g)
 
-    # ---------------- Text diff ----------------
+    # Text diff
     used_b: set[int] = set()
     removed_text: List[Dict] = []
     added_text: List[Dict] = []
@@ -205,6 +196,7 @@ def diff_pages(conn: sqlite3.Connection, old_id: str, new_id: str, page: int) ->
         "geometry": {
             "added": [g.bounds for g in added_geo],
             "removed": [g.bounds for g in removed_geo],
+            "changed": [],  # reserved for raster modes; empty in vector/text diff
         },
         "text": {
             "added": added_text,
@@ -212,3 +204,8 @@ def diff_pages(conn: sqlite3.Connection, old_id: str, new_id: str, page: int) ->
             "moved": moved_text,
         },
     }
+
+def diff_documents_typed(conn: sqlite3.Connection, old_id: str, new_id: str, pages: List[int] | None = None):
+    if page_diff_from_dict is None:
+        raise RuntimeError("Typed models not available; ensure pdf_compare.models defines PageDiff helpers.")
+    return [page_diff_from_dict(d) for d in diff_documents(conn, old_id, new_id, pages)]
