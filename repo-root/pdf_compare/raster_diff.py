@@ -4,7 +4,6 @@ from typing import List, Tuple
 import numpy as np
 import fitz  # PyMuPDF
 import cv2
-import skimage
 try:
     from skimage.metrics import structural_similarity as ssim
     HAVE_SKIMAGE = True
@@ -55,6 +54,18 @@ def _diff_mask(base: np.ndarray, aligned: np.ndarray, method: str = "hybrid") ->
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_RECT, (3,3)), iterations=1)
     return mask
 
+def _apply_exclusions(mask: np.ndarray, zoom: float, exclude_boxes_pdf: List[Tuple[float,float,float,float]] | None):
+    if not exclude_boxes_pdf:
+        return mask
+    H, W = mask.shape[:2]
+    for (x0,y0,x1,y1) in exclude_boxes_pdf:
+        px0, py0, px1, py1 = int(x0*zoom), int(y0*zoom), int(x1*zoom), int(y1*zoom)
+        px0 = max(0, min(W, px0)); px1 = max(0, min(W, px1))
+        py0 = max(0, min(H, py0)); py1 = max(0, min(H, py1))
+        if px1>px0 and py1>py0:
+            mask[py0:py1, px0:px1] = 0
+    return mask
+
 def _boxes_from_mask(mask: np.ndarray, min_area: int = 120, merge_gap: int = 6):
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes = []
@@ -80,10 +91,12 @@ def _boxes_from_mask(mask: np.ndarray, min_area: int = 120, merge_gap: int = 6):
     return [(x0+merge_gap, y0+merge_gap, x1-merge_gap, y1-merge_gap) for (x0,y0,x1,y1) in merged]
 
 def raster_diff_boxes(old_pdf: str, new_pdf: str, page_index: int, dpi: int = 350,
-                      method: str = "hybrid", min_area: int = 120):
+                      method: str = "hybrid", min_area: int = 120,
+                      exclude_boxes_pdf: List[Tuple[float,float,float,float]] | None = None):
     img_old, zoom = _render_page_as_gray(old_pdf, page_index, dpi)
     img_new, _    = _render_page_as_gray(new_pdf, page_index, dpi)
     img_new_aligned = _align_images(img_old, img_new)
     mask = _diff_mask(img_old, img_new_aligned, method=method)
+    mask = _apply_exclusions(mask, zoom, exclude_boxes_pdf)
     boxes_px = _boxes_from_mask(mask, min_area=min_area)
     return [(x0/zoom, y0/zoom, x1/zoom, y1/zoom) for (x0,y0,x1,y1) in boxes_px]
