@@ -207,6 +207,10 @@ def ocr_augment(doc_id: str, db: str = "vectormap.sqlite",
     - only_sparse=True → OCR only pages with little/no native text.
     """
     conn = open_db(db)
+
+    # Ensure source column exists before inserting
+    _ensure_source_column(conn)
+
     # 1) get PDF path + page_count
     row = conn.execute("SELECT path, page_count FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
     if not row:
@@ -230,12 +234,8 @@ def ocr_augment(doc_id: str, db: str = "vectormap.sqlite",
     for p in pages:
         # returns list of {"text": str, "bbox": (x0,y0,x1,y1), ...} in PDF coords
         runs = highres_ocr(pdf_path, p-1, cfg)
-        # upsert into text_rows with source='ocr'
-        for r in runs:
-            conn.execute(
-                "INSERT INTO text_rows (doc_id,page_number,text,bbox,font,size,source) VALUES (?,?,?,?,?,?,?)",
-                (doc_id, p, r["text"], str(list(r["bbox"])), None, None, "ocr")
-            )
+        # Insert using helper function
+        _insert_ocr_spans(conn, doc_id, p, runs)
         conn.commit()
     typer.echo(f"OCR augment complete for {doc_id} (pages: {list(pages)})")
 

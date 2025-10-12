@@ -21,8 +21,46 @@ WORKDIR /app
 # Copy requirements first for better Docker layer caching
 COPY requirements.txt pyproject.toml README.md ./
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies in stages to avoid timeouts
+# Stage 1: Core dependencies (faster)
+RUN pip install --no-cache-dir --timeout=1000 \
+    pymupdf>=1.24.8,<1.28 \
+    shapely>=2.0.2,<2.2 \
+    rtree>=1.2.0,<1.5 \
+    numpy>=1.26,<3 \
+    pillow>=10.3,<12 \
+    typer>=0.12,<1.0 \
+    streamlit>=1.32,<1.51
+
+# Stage 2: Image processing and OCR
+RUN pip install --no-cache-dir --timeout=1000 \
+    opencv-python>=4.8,<5.0 \
+    pytesseract>=0.3.10,<0.4 \
+    scikit-image>=0.21.0,<0.26 \
+    pikepdf>=8.0.0,<10.0
+
+# Stage 3: Database dependencies
+RUN pip install --no-cache-dir --timeout=1000 \
+    sqlalchemy>=2.0.0,<2.1 \
+    alembic>=1.13.0,<1.14 \
+    psycopg2-binary>=2.9.0,<3.0 \
+    asyncpg>=0.29.0,<0.30 \
+    geoalchemy2>=0.14.0,<0.15 \
+    psutil>=5.9.0,<7.0
+
+# Stage 4: RAG/LLM dependencies (heaviest, install last)
+RUN pip install --no-cache-dir --timeout=1000 \
+    langchain>=0.1.0,<0.3 \
+    langchain-community>=0.0.10,<0.3 \
+    langchain-ollama>=0.1.0,<0.2 \
+    pypdf>=3.17.0,<5.0 \
+    tiktoken>=0.5.0,<0.8
+
+# Stage 5: Vector store and embeddings (very heavy due to PyTorch)
+RUN pip install --no-cache-dir --timeout=1000 \
+    chromadb>=0.4.0,<0.6 \
+    sentence-transformers>=2.2.0,<3.0 \
+    faiss-cpu>=1.7.4,<1.9
 
 # Copy application code
 COPY pdf_compare/ ./pdf_compare/

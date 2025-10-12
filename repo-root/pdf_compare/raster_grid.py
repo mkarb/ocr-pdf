@@ -65,11 +65,101 @@ def raster_grid_changed_boxes(
     merge_adjacent: bool = True
 ) -> List[Tuple[float, float, float, float]]:
     """
-    Returns PDF-space boxes (x0,y0,x1,y1) for grid cells flagged as changed.
-    page_index is 0-based.
+    Grid-based raster comparison for two PDF pages at the same page index.
+
+    Divides pages into a grid and flags cells with significant changes.
+
+    Args:
+        old_pdf_path: Path to old PDF
+        new_pdf_path: Path to new PDF
+        page_index: 0-based page index (same for both PDFs)
+        dpi: Render resolution
+        rows: Number of grid rows
+        cols: Number of grid columns
+        method: "hybrid", "abs", or "ssim"
+        cell_change_ratio: Threshold for flagging cells (0.03 = 3%)
+        merge_adjacent: Merge touching changed cells
+
+    Returns:
+        List of bounding boxes (x0, y0, x1, y1) in PDF coordinates
     """
     img_old, zoom = _render_gray(old_pdf_path, page_index, dpi)
     img_new, _    = _render_gray(new_pdf_path, page_index, dpi)
+    img_new = _align_ecc(img_old, img_new)
+
+    mask = _mask_diff(img_old, img_new, method)
+    H, W = mask.shape
+    cell_h = H // rows
+    cell_w = W // cols
+
+    boxes = []
+    for r in range(rows):
+        for c in range(cols):
+            y0 = r * cell_h
+            x0 = c * cell_w
+            y1 = H if r == rows - 1 else (r + 1) * cell_h
+            x1 = W if c == cols - 1 else (c + 1) * cell_w
+            cell = mask[y0:y1, x0:x1]
+            if cell.size == 0:
+                continue
+            ratio = (cell > 0).sum() / float(cell.size)
+            if ratio >= cell_change_ratio:
+                boxes.append((x0/zoom, y0/zoom, x1/zoom, y1/zoom))
+
+    if not merge_adjacent or not boxes:
+        return boxes
+
+    # simple merge of touching/overlapping cells to clean overlays
+    boxes.sort()
+    merged = []
+    for b in boxes:
+        if not merged:
+            merged.append(b); continue
+        x0,y0,x1,y1 = b
+        mx0,my0,mx1,my1 = merged[-1]
+        touch = not (x1 < mx0 or mx1 < x0 or y1 < my0 or my1 < y0)
+        if touch:
+            merged[-1] = (min(mx0,x0), min(my0,y0), max(mx1,x1), max(my1,y1))
+        else:
+            merged.append(b)
+    return merged
+
+
+def raster_grid_changed_boxes_aligned(
+    old_pdf_path: str,
+    new_pdf_path: str,
+    old_page_index: int,
+    new_page_index: int,
+    *,
+    dpi: int = 400,
+    rows: int = 12,
+    cols: int = 16,
+    method: str = "hybrid",
+    cell_change_ratio: float = 0.03,
+    merge_adjacent: bool = True
+) -> List[Tuple[float, float, float, float]]:
+    """
+    Grid-based raster comparison for two PDF pages at different page indices.
+
+    Supports aligned comparison where page numbers may differ.
+
+    Args:
+        old_pdf_path: Path to old PDF
+        new_pdf_path: Path to new PDF
+        old_page_index: 0-based page index in old PDF
+        new_page_index: 0-based page index in new PDF
+        dpi: Render resolution
+        rows: Number of grid rows
+        cols: Number of grid columns
+        method: "hybrid", "abs", or "ssim"
+        cell_change_ratio: Threshold for flagging cells (0.03 = 3%)
+        merge_adjacent: Merge touching changed cells
+
+    Returns:
+        List of bounding boxes (x0, y0, x1, y1) in PDF coordinates
+    """
+    img_old, zoom = _render_gray(old_pdf_path, old_page_index, dpi)
+    img_new, _    = _render_gray(new_pdf_path, new_page_index, dpi)
     img_new = _align_ecc(img_old, img_new)
 
     mask = _mask_diff(img_old, img_new, method)

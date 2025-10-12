@@ -10,7 +10,7 @@ try:
 except Exception:
     HAVE_SKIMAGE = False
 
-def _render_page_as_gray(pdf_path: str, page_index: int, dpi: int = 350):
+def _render_page_as_gray(pdf_path: str, page_index: int, dpi: int = 500):
     doc = fitz.open(pdf_path)
     page = doc[page_index]
     zoom = dpi / 72.0
@@ -93,8 +93,56 @@ def _boxes_from_mask(mask: np.ndarray, min_area: int = 120, merge_gap: int = 6):
 def raster_diff_boxes(old_pdf: str, new_pdf: str, page_index: int, dpi: int = 350,
                       method: str = "hybrid", min_area: int = 120,
                       exclude_boxes_pdf: List[Tuple[float,float,float,float]] | None = None):
+    """
+    Compare two PDF pages at the same page index using raster comparison.
+
+    Args:
+        old_pdf: Path to old PDF
+        new_pdf: Path to new PDF
+        page_index: 0-based page index (same for both PDFs)
+        dpi: Render resolution
+        method: "hybrid" or "ssim"
+        min_area: Minimum change area in pixels
+        exclude_boxes_pdf: Regions to exclude (in PDF coordinates)
+
+    Returns:
+        List of bounding boxes (x0, y0, x1, y1) in PDF coordinates
+    """
     img_old, zoom = _render_page_as_gray(old_pdf, page_index, dpi)
     img_new, _    = _render_page_as_gray(new_pdf, page_index, dpi)
+    img_new_aligned = _align_images(img_old, img_new)
+    mask = _diff_mask(img_old, img_new_aligned, method=method)
+    mask = _apply_exclusions(mask, zoom, exclude_boxes_pdf)
+    boxes_px = _boxes_from_mask(mask, min_area=min_area)
+    return [(x0/zoom, y0/zoom, x1/zoom, y1/zoom) for (x0,y0,x1,y1) in boxes_px]
+
+
+def raster_diff_boxes_aligned(old_pdf: str, new_pdf: str,
+                               old_page_index: int, new_page_index: int,
+                               dpi: int = 350,
+                               method: str = "hybrid", min_area: int = 120,
+                               exclude_boxes_pdf: List[Tuple[float,float,float,float]] | None = None):
+    """
+    Compare two PDF pages at different page indices using raster comparison.
+
+    This function supports aligned comparison where page numbers may differ
+    (e.g., old page 5 compared to new page 7).
+
+    Args:
+        old_pdf: Path to old PDF
+        new_pdf: Path to new PDF
+        old_page_index: 0-based page index in old PDF
+        new_page_index: 0-based page index in new PDF
+        dpi: Render resolution
+        method: "hybrid" or "ssim"
+        min_area: Minimum change area in pixels
+        exclude_boxes_pdf: Regions to exclude (in PDF coordinates)
+
+    Returns:
+        List of bounding boxes (x0, y0, x1, y1) in PDF coordinates
+    """
+    img_old, zoom = _render_page_as_gray(old_pdf, old_page_index, dpi)
+    img_new, _    = _render_page_as_gray(new_pdf, new_page_index, dpi)
     img_new_aligned = _align_images(img_old, img_new)
     mask = _diff_mask(img_old, img_new_aligned, method=method)
     mask = _apply_exclusions(mask, zoom, exclude_boxes_pdf)

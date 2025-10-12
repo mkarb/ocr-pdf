@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import sqlite3
 import json
 import numpy as np
@@ -14,6 +14,12 @@ try:
 except Exception:
     page_diff_from_dict = None
     PageDiff = None  # type: ignore
+
+try:
+    from .page_alignment import align_pages, get_alignment_summary  # type: ignore
+except Exception:
+    align_pages = None  # type: ignore
+    get_alignment_summary = None  # type: ignore
 
 try:
     _major = int(shapely.__version__.split(".", 1)[0])
@@ -109,6 +115,9 @@ def diff_documents(conn: sqlite3.Connection, old_id: str, new_id: str, pages: Li
     """
     Compare two ingested documents page by page (vector + text).
     Returns a list of per-page diff dicts compatible with overlay.py.
+
+    Note: This function assumes page numbers align (1:1, 2:2, etc.).
+    For documents with inserted/deleted pages, use diff_documents_aligned() instead.
     """
     row_old = conn.execute("SELECT page_count FROM documents WHERE doc_id=?", (old_id,)).fetchone()
     row_new = conn.execute("SELECT page_count FROM documents WHERE doc_id=?", (new_id,)).fetchone()
@@ -119,19 +128,164 @@ def diff_documents(conn: sqlite3.Connection, old_id: str, new_id: str, pages: Li
     max_pages = min(pc_old, pc_new)
     if pages is None:
         pages = list(range(1, max_pages + 1))
-    return [diff_pages(conn, old_id, new_id, p) for p in pages]
+    return [diff_pages(conn, old_id, new_id, p, p) for p in pages]
 
-def diff_pages(conn: sqlite3.Connection, old_id: str, new_id: str, page: int) -> Dict:
+def diff_documents_typed(conn: sqlite3.Connection, old_id: str, new_id: str, pages: List[int] | None = None):
+    if page_diff_from_dict is None:
+        raise RuntimeError("Typed models not available; ensure pdf_compare.models defines PageDiff helpers.")
+    return [page_diff_from_dict(d) for d in diff_documents(conn, old_id, new_id, pages)]
+
+
+# -----------------------
+# Aligned comparison (handles page insertions/deletions)
+# -----------------------
+def diff_documents_aligned(
+    conn: sqlite3.Connection,
+    old_id: str,
+    new_id: str,
+    alignment_method: str = "dynamic",
+    similarity_threshold: float = 0.5
+) -> Tuple[List[Dict], List[Tuple[Optional[int], Optional[int], float]]]:
+    """
+    Compare two documents with intelligent page alignment.
+
+    Handles cases where pages are inserted, deleted, or reordered.
+    Uses content-based matching to align pages before comparison.
+
+    Args:
+        conn: Database connection
+        old_id: Old document ID
+        new_id: New document ID
+        alignment_method: "greedy" (faster) or "dynamic" (optimal, default)
+        similarity_threshold: Minimum similarity to match pages (0.0-1.0, default 0.5)
+
+    Returns:
+        Tuple of (diffs, alignments):
+            - diffs: List of page diff dicts (same format as diff_documents)
+            - alignments: List of (old_page, new_page, score) tuples
+
+    Example:
+        diffs, alignments = diff_documents_aligned(conn, "old", "new")
+
+        print("Page Alignment:")
+        for old_pg, new_pg, score in alignments:
+            if old_pg and new_pg:
+                print(f"  Page {old_pg} → {new_pg} (match: {score:.2%})")
+            elif old_pg:
+                print(f"  Page {old_pg} was DELETED")
+            else:
+                print(f"  Page {new_pg} was INSERTED")
+
+        print(f"\\nFound {len(diffs)} page diffs")
+    """
+    if align_pages is None:
+        raise RuntimeError("Page alignment module not available. Check page_alignment.py import.")
+
+    # Step 1: Compute page alignment
+    alignments = align_pages(conn, old_id, new_id, alignment_method, similarity_threshold)
+
+    # Step 2: Compare aligned pages
+    diffs = []
+
+    for old_page, new_page, score in alignments:
+        if old_page and new_page:
+            # Pages matched - compare them
+            diff = diff_pages(conn, old_id, new_id, old_page, new_page)
+            diff["alignment"] = {
+                "old_page": old_page,
+                "new_page": new_page,
+                "similarity": score,
+                "status": "matched"
+            }
+            diffs.append(diff)
+
+        elif old_page and not new_page:
+            # Page was deleted - show all content as removed
+            a_geoms = _load_page_geoms(conn, old_id, old_page)
+            a_txt = _load_page_texts(conn, old_id, old_page)
+
+            diff = {
+                "page": old_page,
+                "geometry": {
+                    "added": [],
+                    "removed": [g.bounds for g in a_geoms],
+                    "changed": [],
+                },
+                "text": {
+                    "added": [],
+                    "removed": [{"text": t, "bbox": bb} for t, bb in a_txt],
+                    "moved": [],
+                },
+                "alignment": {
+                    "old_page": old_page,
+                    "new_page": None,
+                    "similarity": 0.0,
+                    "status": "deleted"
+                }
+            }
+            diffs.append(diff)
+
+        elif not old_page and new_page:
+            # Page was inserted - show all content as added
+            b_geoms = _load_page_geoms(conn, new_id, new_page)
+            b_txt = _load_page_texts(conn, new_id, new_page)
+
+            diff = {
+                "page": new_page,
+                "geometry": {
+                    "added": [g.bounds for g in b_geoms],
+                    "removed": [],
+                    "changed": [],
+                },
+                "text": {
+                    "added": [{"text": t, "bbox": bb} for t, bb in b_txt],
+                    "removed": [],
+                    "moved": [],
+                },
+                "alignment": {
+                    "old_page": None,
+                    "new_page": new_page,
+                    "similarity": 0.0,
+                    "status": "inserted"
+                }
+            }
+            diffs.append(diff)
+
+    return diffs, alignments
+
+
+def diff_pages(
+    conn: sqlite3.Connection,
+    old_id: str,
+    new_id: str,
+    old_page: int,
+    new_page: Optional[int] = None
+) -> Dict:
+    """
+    Compare two specific pages (possibly from different page numbers).
+
+    Args:
+        old_id: Old document ID
+        new_id: New document ID
+        old_page: Page number in old document
+        new_page: Page number in new document (defaults to old_page if None)
+
+    This is the updated version that supports aligned comparison.
+    The old diff_pages signature (3 args) is preserved for backward compatibility.
+    """
+    if new_page is None:
+        new_page = old_page
+
     # Load content
-    a_geoms = _load_page_geoms(conn, old_id, page)
-    b_geoms = _load_page_geoms(conn, new_id, page)
-    a_txt = _load_page_texts(conn, old_id, page)
-    b_txt = _load_page_texts(conn, new_id, page)
+    a_geoms = _load_page_geoms(conn, old_id, old_page)
+    b_geoms = _load_page_geoms(conn, new_id, new_page)
+    a_txt = _load_page_texts(conn, old_id, old_page)
+    b_txt = _load_page_texts(conn, new_id, new_page)
 
     # Early no-op
     if not a_geoms and not b_geoms and not a_txt and not b_txt:
         return {
-            "page": page,
+            "page": new_page,  # Use new_page for consistency
             "geometry": {"added": [], "removed": [], "changed": []},
             "text": {"added": [], "removed": [], "moved": []},
         }
@@ -192,7 +346,7 @@ def diff_pages(conn: sqlite3.Connection, old_id: str, new_id: str, page: int) ->
             added_text.append({"text": t2, "bbox": bb2})
 
     return {
-        "page": page,
+        "page": new_page,  # Use new_page for consistency
         "geometry": {
             "added": [g.bounds for g in added_geo],
             "removed": [g.bounds for g in removed_geo],
@@ -204,8 +358,3 @@ def diff_pages(conn: sqlite3.Connection, old_id: str, new_id: str, page: int) ->
             "moved": moved_text,
         },
     }
-
-def diff_documents_typed(conn: sqlite3.Connection, old_id: str, new_id: str, pages: List[int] | None = None):
-    if page_diff_from_dict is None:
-        raise RuntimeError("Typed models not available; ensure pdf_compare.models defines PageDiff helpers.")
-    return [page_diff_from_dict(d) for d in diff_documents(conn, old_id, new_id, pages)]

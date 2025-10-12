@@ -65,9 +65,10 @@ logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").set
 try:
     from pdf_compare.pdf_extract import pdf_to_vectormap
     from pdf_compare.pdf_extract_server import pdf_to_vectormap_server
-    from pdf_compare.store import open_db, upsert_vectormap, list_documents
-    from pdf_compare.search import search_text as vm_search_text
-    from pdf_compare.compare import diff_documents
+    from pdf_compare.db_backend import DatabaseBackend
+    from pdf_compare.store_new import upsert_vectormap, list_documents
+    from pdf_compare.search_new import search_text as vm_search_text
+    from pdf_compare.compare_new import diff_documents
     from pdf_compare.overlay import write_overlay
     import fitz  # PyMuPDF for getting page count
 except Exception as e:
@@ -83,8 +84,29 @@ st.set_page_config(page_title="PDF Revision Diff (Local)", layout="wide")
 # Sidebar configuration
 st.sidebar.header("Configuration")
 
-def_path = Path.cwd() / "vectormap.sqlite"
-db_path = st.sidebar.text_input("SQLite DB path", value=str(def_path))
+# PostgreSQL connection from environment variable
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    st.error(
+        "⚠️ **DATABASE_URL not set!**\n\n"
+        "This application requires PostgreSQL. Set the DATABASE_URL environment variable:\n\n"
+        "```\n"
+        "DATABASE_URL=postgresql://user:password@host:5432/dbname\n"
+        "```\n\n"
+        "For local development:\n"
+        "```bash\n"
+        "export DATABASE_URL=postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare\n"
+        "```"
+    )
+    st.stop()
+
+st.sidebar.success(f"🐘 **PostgreSQL Connected**")
+# Show sanitized connection info (hide password)
+if "@" in DATABASE_URL:
+    display_url = DATABASE_URL.split("@")[1]
+    st.sidebar.caption(f"Host: `{display_url}`")
+
 outputs_dir = Path.cwd() / "outputs"
 uploads_dir = Path.cwd() / "uploads"
 outputs_dir.mkdir(exist_ok=True)
@@ -103,10 +125,15 @@ num_workers = st.sidebar.slider(
 )
 st.sidebar.caption(f"💡 Using {num_workers} worker(s) for parallel extraction")
 
-# Open (and initialize) DB connection lazily per action
+# Database connection singleton
+@st.cache_resource
+def get_db_backend():
+    """Get DatabaseBackend singleton"""
+    return DatabaseBackend(DATABASE_URL)
 
 def get_conn():
-    return open_db(db_path)
+    """Get database backend for operations"""
+    return get_db_backend()
 
 st.title("PDF Revision Diff – Local UI")
 st.caption("Drop PDFs, index & search content, and generate visual diff overlays. All local.")
@@ -146,12 +173,17 @@ with st.expander("Upload PDFs", expanded=True):
             with status_container:
                 st.info(f"📄 Processing file {file_idx}/{total_files}: **{uf.name}**")
 
-            # Persist the uploaded bytes to disk
-            target = uploads_dir / uf.name
+            # Generate unique filename to avoid collisions
+            # Format: timestamp_originalname.pdf
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds
+            base_name = Path(uf.name).stem
+            extension = Path(uf.name).suffix
+            unique_name = f"{timestamp}_{base_name}{extension}"
+            target = uploads_dir / unique_name
             start_time = time.time()
 
             if debug_mode:
-                debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Saving {uf.name} to disk...")
+                debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Saving {uf.name} as {unique_name}...")
 
             with open(target, "wb") as f:
                 f.write(uf.getbuffer())
