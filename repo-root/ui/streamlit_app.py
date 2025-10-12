@@ -44,9 +44,17 @@ Notes
 import io
 import os
 import logging
+import time
 from pathlib import Path
 from typing import List, Tuple
+from datetime import datetime
 
+# Optional CPU monitoring
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 import streamlit as st
 
@@ -56,10 +64,12 @@ logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").set
 # Try to import the vectormap modules. Provide a clear error if missing.
 try:
     from pdf_compare.pdf_extract import pdf_to_vectormap
+    from pdf_compare.pdf_extract_server import pdf_to_vectormap_server
     from pdf_compare.store import open_db, upsert_vectormap, list_documents
     from pdf_compare.search import search_text as vm_search_text
     from pdf_compare.compare import diff_documents
     from pdf_compare.overlay import write_overlay
+    import fitz  # PyMuPDF for getting page count
 except Exception as e:
     st.error(
         "Couldn't import the 'pdf_compare' package. Ensure the modules from our previous step are available.\n"
@@ -80,6 +90,19 @@ uploads_dir = Path.cwd() / "uploads"
 outputs_dir.mkdir(exist_ok=True)
 uploads_dir.mkdir(exist_ok=True)
 
+# Performance settings
+st.sidebar.subheader("Performance")
+cpu_count = os.cpu_count() or 4
+default_workers = max(1, cpu_count - 1)
+num_workers = st.sidebar.slider(
+    "Worker Processes",
+    min_value=1,
+    max_value=cpu_count,
+    value=default_workers,
+    help=f"Number of parallel workers for PDF extraction. Your system has {cpu_count} cores. Recommended: {default_workers}"
+)
+st.sidebar.caption(f"💡 Using {num_workers} worker(s) for parallel extraction")
+
 # Open (and initialize) DB connection lazily per action
 
 def get_conn():
@@ -97,26 +120,140 @@ with st.expander("Upload PDFs", expanded=True):
         accept_multiple_files=True,
         help="Files are stored locally under ./uploads and indexed into SQLite."
     )
+
+    # Add debug mode toggle
+    debug_mode = st.checkbox("Enable debug logging", value=False, help="Show detailed extraction progress")
+
     ingest_btn = st.button("Ingest selected PDFs", type="primary", disabled=not uploaded)
 
     if ingest_btn and uploaded:
         conn = get_conn()
-        progress = st.progress(0)
-        status = st.empty()
-        for i, uf in enumerate(uploaded, start=1):
+
+        # Create containers for progress visualization
+        overall_progress = st.progress(0, text="Overall Progress")
+        file_progress_container = st.container()
+        page_progress_bar = st.progress(0, text="Page Progress")
+        status_container = st.container()
+
+        # Debug feed container
+        if debug_mode:
+            debug_feed = st.expander("Debug Feed", expanded=True)
+            debug_messages = []
+
+        total_files = len(uploaded)
+
+        for file_idx, uf in enumerate(uploaded, start=1):
+            with status_container:
+                st.info(f"📄 Processing file {file_idx}/{total_files}: **{uf.name}**")
+
             # Persist the uploaded bytes to disk
             target = uploads_dir / uf.name
+            start_time = time.time()
+
+            if debug_mode:
+                debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Saving {uf.name} to disk...")
+
             with open(target, "wb") as f:
                 f.write(uf.getbuffer())
-            status.write(f"Ingesting {uf.name}…")
+
+            if debug_mode:
+                debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] File saved to {target}")
+
             try:
-                vm = pdf_to_vectormap(str(target))
+                # Get page count first for better progress tracking
+                doc = fitz.open(str(target))
+                page_count = doc.page_count
+                doc.close()
+
+                if debug_mode:
+                    debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] PDF has {page_count} pages")
+                    actual_workers = min(num_workers, page_count)  # Can't use more workers than pages
+                    debug_messages.append(
+                        f"[{datetime.now().strftime('%H:%M:%S')}] "
+                        f"Using {actual_workers} worker process(es) (configured: {num_workers}, available cores: {cpu_count})"
+                    )
+                    debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Starting vector extraction...")
+
+                # Progress callback for page-level tracking
+                def update_progress(completed_pages, total_pages):
+                    progress_pct = completed_pages / total_pages
+                    page_progress_bar.progress(
+                        progress_pct,
+                        text=f"Extracting page {completed_pages}/{total_pages}"
+                    )
+                    if debug_mode:
+                        debug_messages.append(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] "
+                            f"Extracted page {completed_pages}/{total_pages} "
+                            f"({progress_pct*100:.1f}%)"
+                        )
+                        with debug_feed:
+                            st.text_area(
+                                "Debug Log",
+                                value="\n".join(debug_messages[-50:]),  # Show last 50 messages
+                                height=200,
+                                key=f"debug_{file_idx}_{completed_pages}"
+                            )
+
+                # Use server mode with progress callback and configured workers
+                vm = pdf_to_vectormap_server(
+                    str(target),
+                    workers=num_workers,
+                    progress_callback=update_progress
+                )
+
+                if debug_mode:
+                    debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Vector extraction complete")
+                    debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Storing in database...")
+
                 upsert_vectormap(conn, vm)
-                st.success(f"Ingested {uf.name} as doc_id={vm.meta.doc_id} ({vm.meta.page_count} pages)")
+
+                elapsed = time.time() - start_time
+
+                if debug_mode:
+                    debug_messages.append(
+                        f"[{datetime.now().strftime('%H:%M:%S')}] "
+                        f"Database storage complete (total time: {elapsed:.2f}s)"
+                    )
+
+                with status_container:
+                    st.success(
+                        f"✅ Ingested **{uf.name}** as `{vm.meta.doc_id}` "
+                        f"({vm.meta.page_count} pages in {elapsed:.1f}s, "
+                        f"{vm.meta.page_count/elapsed:.1f} pages/sec)"
+                    )
+
             except Exception as ex:
-                st.error(f"Failed to ingest {uf.name}: {ex}")
-            progress.progress(i / len(uploaded))
-        status.write("Done.")
+                if debug_mode:
+                    debug_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: {str(ex)}")
+                    with debug_feed:
+                        st.text_area(
+                            "Debug Log",
+                            value="\n".join(debug_messages[-50:]),
+                            height=200,
+                            key=f"debug_{file_idx}_error"
+                        )
+                with status_container:
+                    st.error(f"Failed to ingest {uf.name}: {ex}")
+
+            # Update overall progress
+            overall_progress.progress(
+                file_idx / total_files,
+                text=f"Overall Progress: {file_idx}/{total_files} files"
+            )
+
+        # Final debug log
+        if debug_mode:
+            with debug_feed:
+                st.text_area(
+                    "Final Debug Log",
+                    value="\n".join(debug_messages),
+                    height=300,
+                    key="debug_final"
+                )
+
+        with status_container:
+            st.success(f"🎉 All done! Processed {total_files} file(s)")
 
 # --- Section: Inventory ---
 st.subheader("2) Indexed Documents")

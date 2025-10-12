@@ -1,18 +1,25 @@
 # Dockerfile for PDF Compare Server
+# Connects to external Ollama service
 FROM python:3.11-slim
 
-# Install system dependencies for PyMuPDF, Tesseract OCR, and Shapely
+# Install system dependencies for PyMuPDF, Tesseract OCR, Shapely, and RAG features
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-eng \
     libgeos-dev \
+    build-essential \
+    libssl-dev \
+    libffi-dev \
+    sqlite3 \
+    libsqlite3-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
 # Copy requirements first for better Docker layer caching
-COPY requirements.txt pyproject.toml ./
+COPY requirements.txt pyproject.toml README.md ./
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
@@ -20,6 +27,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY pdf_compare/ ./pdf_compare/
 COPY ui/ ./ui/
+COPY test_rag.py setup_check.py ./
 
 # Create directories for data persistence
 RUN mkdir -p /app/data/uploads /app/data/outputs /app/data/db
@@ -29,7 +37,8 @@ ENV CPU_LIMIT=4 \
     PDF_MIN_SEGMENT_LEN=0.50 \
     PDF_MIN_FILL_AREA=0.50 \
     PDF_BEZIER_SAMPLES=24 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    OLLAMA_HOST=http://host.docker.internal:11434
 
 # Expose ports
 # 8000: API server (future)

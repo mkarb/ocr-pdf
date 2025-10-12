@@ -1,0 +1,104 @@
+# Dockerfile for PDF Compare Server with Ollama
+# Self-contained deployment with AI features
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    # PDF processing
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    libgeos-dev \
+    # Build tools for Python packages
+    build-essential \
+    libssl-dev \
+    libffi-dev \
+    sqlite3 \
+    libsqlite3-dev \
+    # Ollama dependencies
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Ollama
+RUN curl -fsSL https://ollama.com/install.sh | sh
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements first for better Docker layer caching
+COPY requirements.txt pyproject.toml README.md ./
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY pdf_compare/ ./pdf_compare/
+COPY ui/ ./ui/
+COPY test_rag.py setup_check.py ./
+
+# Create directories for data persistence
+RUN mkdir -p /app/data/uploads /app/data/outputs /app/data/db /app/data/ollama
+
+# Environment variables for server configuration
+ENV CPU_LIMIT=4 \
+    PDF_MIN_SEGMENT_LEN=0.50 \
+    PDF_MIN_FILL_AREA=0.50 \
+    PDF_BEZIER_SAMPLES=24 \
+    PYTHONUNBUFFERED=1 \
+    OLLAMA_HOST=http://localhost:11434 \
+    OLLAMA_MODELS=/app/data/ollama
+
+# Expose ports
+# 8501: Streamlit UI
+# 11434: Ollama API
+EXPOSE 8501 11434
+
+# Create startup script that initializes Ollama
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+echo "Starting Ollama service..."\n\
+ollama serve &\n\
+OLLAMA_PID=$!\n\
+\n\
+# Wait for Ollama to be ready\n\
+echo "Waiting for Ollama to start..."\n\
+for i in {1..30}; do\n\
+    if curl -s http://localhost:11434/api/version > /dev/null 2>&1; then\n\
+        echo "Ollama is ready!"\n\
+        break\n\
+    fi\n\
+    if [ $i -eq 30 ]; then\n\
+        echo "ERROR: Ollama failed to start"\n\
+        exit 1\n\
+    fi\n\
+    sleep 1\n\
+done\n\
+\n\
+# Pull models if not already present\n\
+echo "Checking for required models..."\n\
+if ! ollama list | grep -q "llama3.2"; then\n\
+    echo "Pulling llama3.2 model (this will take a few minutes)..."\n\
+    ollama pull llama3.2\n\
+fi\n\
+\n\
+if ! ollama list | grep -q "nomic-embed-text"; then\n\
+    echo "Pulling nomic-embed-text model..."\n\
+    ollama pull nomic-embed-text\n\
+fi\n\
+\n\
+echo "Models ready!"\n\
+ollama list\n\
+\n\
+# Start Streamlit\n\
+echo "Starting Streamlit UI..."\n\
+exec streamlit run ui/streamlit_app.py --server.address 0.0.0.0 --server.port 8501\n\
+' > /app/start.sh && chmod +x /app/start.sh
+
+# Health check - verify both Ollama and Streamlit
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:11434/api/version && \
+        curl -f http://localhost:8501/_stcore/health || exit 1
+
+# Run startup script
+CMD ["/app/start.sh"]
