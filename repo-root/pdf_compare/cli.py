@@ -1,9 +1,10 @@
 import typer
 import os
 from .pdf_extract import pdf_to_vectormap
-from .store import open_db, upsert_vectormap, list_documents
-from .search import search_text as search_text_fts
-from .compare import diff_documents
+from .db_backend import DatabaseBackend
+from .store_new import upsert_vectormap, list_documents
+from .search_new import search_text as search_text_fts
+from .compare_new import diff_documents
 from .overlay import write_overlay
 from .raster_grid import raster_grid_changed_boxes
 from .analyzers.highres_ocr import highres_ocr, HighResOCRConfig
@@ -11,11 +12,36 @@ import fitz
 
 app = typer.Typer(add_completion=False)
 
+# Helper to get database connection
+def get_db_connection(db_url: str | None = None):
+    """
+    Get database connection from DATABASE_URL env var or provided URL.
+
+    Args:
+        db_url: Optional database URL override
+
+    Returns:
+        DatabaseBackend instance
+    """
+    url = db_url or os.getenv("DATABASE_URL")
+    if not url:
+        typer.echo(
+            "❌ DATABASE_URL not set!\n\n"
+            "This CLI requires PostgreSQL. Set the DATABASE_URL environment variable:\n\n"
+            "  export DATABASE_URL=postgresql://user:password@host:5432/dbname\n\n"
+            "For local development:\n"
+            "  export DATABASE_URL=postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare\n",
+            err=True
+        )
+        raise typer.Exit(code=1)
+
+    return DatabaseBackend(url)
+
 @app.command()
 def ingest(
     pdf: str,
-    db: str = "vectormap.sqlite",
     doc_id: str | None = None,
+    db_url: str | None = typer.Option(None, "--db-url", help="PostgreSQL URL (or use DATABASE_URL env var)"),
     use_server_mode: bool = typer.Option(
         False,
         "--server",
@@ -23,9 +49,13 @@ def ingest(
     )
 ):
     """
-    Ingest a PDF into the vector database.
+    Ingest a PDF into the PostgreSQL database.
 
     Use --server flag for server/Docker deployments (faster, no Streamlit compatibility).
+
+    Example:
+        export DATABASE_URL=postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare
+        compare-pdf-revs ingest document.pdf
     """
     if use_server_mode or os.getenv("PDF_SERVER_MODE"):
         from .pdf_extract_server import pdf_to_vectormap_server
@@ -33,17 +63,35 @@ def ingest(
     else:
         vm = pdf_to_vectormap(pdf, doc_id=doc_id)
 
-    conn = open_db(db)
-    upsert_vectormap(conn, vm)
-    typer.echo(f"Ingested {vm.meta.path} as {vm.meta.doc_id} with {vm.meta.page_count} pages.")
+    backend = get_db_connection(db_url)
+    upsert_vectormap(backend, vm)
+    typer.echo(f"✅ Ingested {vm.meta.path} as {vm.meta.doc_id} with {vm.meta.page_count} pages.")
 
 @app.command()
-def search_text(q: str, db: str="vectormap.sqlite", doc_id: str|None=None, page: int|None=None):
-    from .search import search_text as st
-    conn = open_db(db)
-    rows = st(conn, q, doc_id, page, limit=100)
+def search_text(
+    q: str,
+    doc_id: str | None = None,
+    page: int | None = None,
+    db_url: str | None = typer.Option(None, "--db-url", help="PostgreSQL URL (or use DATABASE_URL env var)"),
+    limit: int = typer.Option(100, help="Maximum number of results")
+):
+    """
+    Search for text in ingested PDF documents.
+
+    Example:
+        export DATABASE_URL=postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare
+        compare-pdf-revs search-text "error message" --doc-id doc123 --limit 50
+    """
+    backend = get_db_connection(db_url)
+    rows = search_text_fts(backend, q, doc_id, page, limit=limit)
+
+    if not rows:
+        typer.echo("No results found.")
+        return
+
+    typer.echo(f"Found {len(rows)} results:\n")
     for r in rows:
-        print(r)
+        typer.echo(f"  Doc: {r[0]} | Page: {r[1]} | Text: {r[2][:80]}...")
 
 @app.command()
 def compare_grid(
@@ -96,9 +144,9 @@ def compare_grid(
 def compare(
     old_id: str,
     new_id: str,
-    db: str = "vectormap.sqlite",
     out_overlay: str | None = None,
     base_pdf: str | None = None,
+    db_url: str | None = typer.Option(None, "--db-url", help="PostgreSQL URL (or use DATABASE_URL env var)"),
 
     # --- OCR augment knobs ---
     with_ocr: bool = typer.Option(False, help="Run OCR augment on NEW doc before vector/text diff"),
@@ -114,147 +162,104 @@ def compare(
     changed_cells_ratio: float = 0.03,
 ):
     """
-    Vector/Text compare (DB). Optionally OCR the NEW document first.
+    Vector/Text compare using PostgreSQL database. Optionally OCR the NEW document first.
 
     ocr_mode:
       - sparse        -> OCR only pages with very little native text (fast)
       - all           -> OCR every page
       - changed-cells -> Use raster grid to find changed regions, OCR only those tiles (fast + focused)
+
+    Example:
+        export DATABASE_URL=postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare
+        compare-pdf-revs compare old_doc new_doc --with-ocr --ocr-mode sparse
     """
-    conn = open_db(db)
+    backend = get_db_connection(db_url)
 
     if with_ocr:
-        _ensure_source_column(conn)
-
-        # NEW doc path + pages
-        row = conn.execute(
-            "SELECT path, page_count FROM documents WHERE doc_id=?",
-            (new_id,)
-        ).fetchone()
-        if not row:
-            raise typer.Exit(code=1)
-        new_pdf, page_count = row[0], row[1]
-
-        # choose pages
-        pages = list(range(1, page_count + 1))
-        changed_boxes_by_page: dict[int, list[tuple[float, float, float, float]]] = {}
-
-        if ocr_mode == "sparse":
-            sparse = []
-            for p in pages:
-                n = conn.execute(
-                    "SELECT COUNT(*) FROM text_rows WHERE doc_id=? AND page_number=?",
-                    (new_id, p)
-                ).fetchone()[0]
-                if n < 5:  # heuristic threshold for "low native text"
-                    sparse.append(p)
-            pages = sparse
-
-        elif ocr_mode == "changed-cells":
-            # Need OLD pdf path to compute changed tiles
-            row2 = conn.execute(
-                "SELECT path FROM documents WHERE doc_id=?",
-                (old_id,)
-            ).fetchone()
-            if not row2:
-                raise typer.Exit(code=1)
-            old_pdf = row2[0]
-
-            for i in range(page_count):  # i is 0-based
-                boxes = raster_grid_changed_boxes(
-                    old_pdf, new_pdf, i,
-                    dpi=changed_cells_dpi,
-                    rows=changed_cells_rows,
-                    cols=changed_cells_cols,
-                    method="hybrid",
-                    cell_change_ratio=changed_cells_ratio,
-                    merge_adjacent=True,
-                )
-                if boxes:
-                    changed_boxes_by_page[i + 1] = boxes  # store as 1-based
-            pages = list(changed_boxes_by_page.keys())
-
-        # run OCR
-        cfg = HighResOCRConfig(dpi=ocr_dpi, psm=ocr_psm, min_conf=ocr_min_conf)
-        if not pages:
-            print(f"OCR: no pages selected (mode: {ocr_mode})")
-        else:
-            print(f"OCR mode={ocr_mode}; pages={pages}")
-            for p in pages:
-                if ocr_mode == "changed-cells":
-                    tiles = changed_boxes_by_page.get(p, [])
-                    spans = highres_ocr(new_pdf, p - 1, cfg, tiles_pdf=tiles)
-                else:
-                    spans = highres_ocr(new_pdf, p - 1, cfg)
-                _insert_ocr_spans(conn, new_id, p, spans)
-                print(f"OCR page {p}/{page_count}: {len(spans)} spans")
-            conn.commit()
-            print("OCR augment complete.")
+        typer.echo("⚠️  OCR augmentation with PostgreSQL backend not yet implemented in CLI.")
+        typer.echo("    Use the Streamlit UI or run ocr-augment command separately.")
+        typer.echo("    Proceeding with comparison without OCR...\n")
 
     # Proceed with vector/text diff (DB-backed)
-    diffs = diff_documents(conn, old_id, new_id)
-    print(f"Compared {len(diffs)} pages.")
+    diffs = diff_documents(backend, old_id, new_id)
+    typer.echo(f"✅ Compared {len(diffs)} pages.")
     if out_overlay and base_pdf:
         write_overlay(base_pdf, diffs, out_overlay)
         print(f"Wrote overlay to {out_overlay}")
 
 
 @app.command()
-def ocr_augment(doc_id: str, db: str = "vectormap.sqlite",
-                dpi: int = 500, min_conf: int = 60, only_sparse: bool = True):
+def ocr_augment(
+    doc_id: str,
+    dpi: int = 500,
+    min_conf: int = 60,
+    only_sparse: bool = True,
+    db_url: str | None = typer.Option(None, "--db-url", help="PostgreSQL URL (or use DATABASE_URL env var)")
+):
     """
-    Add OCR text runs to existing document in the DB.
+    Add OCR text runs to existing document in the PostgreSQL database.
+
     - only_sparse=True → OCR only pages with little/no native text.
+
+    Example:
+        export DATABASE_URL=postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare
+        compare-pdf-revs ocr-augment doc_id123 --only-sparse
     """
-    conn = open_db(db)
+    backend = get_db_connection(db_url)
 
-    # Ensure source column exists before inserting
-    _ensure_source_column(conn)
+    # Get document info
+    with backend.get_session() as session:
+        from .db_models import Document, TextRow
+        doc = session.query(Document).filter(Document.doc_id == doc_id).first()
+        if not doc:
+            typer.echo(f"❌ Document {doc_id} not found", err=True)
+            raise typer.Exit(code=1)
 
-    # 1) get PDF path + page_count
-    row = conn.execute("SELECT path, page_count FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
-    if not row:
-        raise typer.Exit(code=1)
-    pdf_path, page_count = row
+        pdf_path = doc.path
+        page_count = doc.page_count
 
-    # 2) determine which pages to OCR
-    pages = range(1, page_count + 1)
-    if only_sparse:
-        sparse = []
-        for p in pages:
-            n = conn.execute("SELECT COUNT(*) FROM text_rows WHERE doc_id=? AND page_number=?", (doc_id, p)).fetchone()[0]
-            if n < 5:   # heuristic
-                sparse.append(p)
-        pages = sparse
+        # Determine which pages to OCR
+        pages = list(range(1, page_count + 1))
+        if only_sparse:
+            sparse = []
+            for p in pages:
+                n = session.query(TextRow).filter(
+                    TextRow.doc_id == doc_id,
+                    TextRow.page_number == p
+                ).count()
+                if n < 5:  # heuristic
+                    sparse.append(p)
+            pages = sparse
 
     if not pages:
-        typer.echo("No pages need OCR."); return
+        typer.echo("ℹ️  No pages need OCR.")
+        return
 
+    typer.echo(f"📄 Running OCR on {len(pages)} pages...")
     cfg = HighResOCRConfig(dpi=dpi, psm=11, min_conf=min_conf, max_workers=6, ram_budget_mb=10240)
-    for p in pages:
-        # returns list of {"text": str, "bbox": (x0,y0,x1,y1), ...} in PDF coords
-        runs = highres_ocr(pdf_path, p-1, cfg)
-        # Insert using helper function
-        _insert_ocr_spans(conn, doc_id, p, runs)
-        conn.commit()
-    typer.echo(f"OCR augment complete for {doc_id} (pages: {list(pages)})")
+
+    with backend.get_session() as session:
+        from .db_models import TextRow
+        for p in pages:
+            runs = highres_ocr(pdf_path, p-1, cfg)
+            typer.echo(f"  Page {p}/{page_count}: {len(runs)} OCR spans")
+
+            # Insert OCR text runs
+            for r in runs:
+                text_row = TextRow(
+                    doc_id=doc_id,
+                    page_number=p,
+                    text=r["text"],
+                    bbox=str(list(r["bbox"])),
+                    font=None,
+                    size=None,
+                    source="ocr"
+                )
+                session.add(text_row)
+            session.commit()
+
+    typer.echo(f"✅ OCR augment complete for {doc_id}")
 
 
-def _ensure_source_column(conn):
-    # safe to run each time
-    try:
-        conn.execute("ALTER TABLE text_rows ADD COLUMN source TEXT DEFAULT 'native'")
-    except Exception:
-        pass
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_text_rows_source ON text_rows(source)")
-    conn.commit()
-
-
-def _insert_ocr_spans(conn, doc_id: str, page_1based: int, spans: list[dict]):
-    for r in spans:
-        conn.execute(
-            "INSERT INTO text_rows (doc_id,page_number,text,bbox,font,size,source) VALUES (?,?,?,?,?,?,?)",
-            (doc_id, page_1based, r["text"], str(list(r["bbox"])), None, None, "ocr")
-        )
 if __name__ == "__main__":
     app()
