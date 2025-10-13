@@ -42,7 +42,7 @@ class Page(Base):
 
 class GeometryRow(Base):
     """Geometry (vector) data table with spatial indexing."""
-    __tablename__ = "geometry"
+    __tablename__ = "pdf_geometry"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     doc_id = Column(String, ForeignKey("documents.doc_id", ondelete="CASCADE"), nullable=False)

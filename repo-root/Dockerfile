@@ -94,6 +94,7 @@ ENV CPU_LIMIT=4 \
     PDF_MIN_FILL_AREA=0.50 \
     PDF_BEZIER_SAMPLES=24 \
     PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
     OLLAMA_HOST=http://host.docker.internal:11434
 
 # Expose ports
@@ -101,9 +102,9 @@ ENV CPU_LIMIT=4 \
 # 8501: Streamlit UI
 EXPOSE 8000 8501
 
-# Health check
+# Health check - verify Streamlit is running
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import pdf_compare; print('OK')" || exit 1
+    CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
 # Default command runs Streamlit UI
 CMD ["streamlit", "run", "ui/streamlit_app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
