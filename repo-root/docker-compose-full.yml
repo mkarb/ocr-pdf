@@ -1,10 +1,34 @@
-version: '3.8'
-
-# Complete deployment with PostgreSQL + Ollama + PDF Compare UI
-# All AI features included
+# ============================================================================
+# PDF Compare - Multi-Container Deployment
+# ============================================================================
+# This docker-compose file separates services into independent containers:
+#
+# 1. POSTGRES   - Database (postgis/postgis pre-built image)
+# 2. OLLAMA     - AI/LLM service (ollama/ollama pre-built image)
+# 3. APP        - Your PDF Compare UI/code (built from Dockerfile)
+#
+# Each container can be started/stopped/updated INDEPENDENTLY without
+# affecting the others. Data is persisted in named volumes.
+#
+# Usage:
+#   Start everything:        docker-compose -f docker-compose-full.yml up -d
+#   Start Postgres only:     docker-compose -f docker-compose-full.yml up -d postgres
+#   Start Ollama only:       docker-compose -f docker-compose-full.yml up -d ollama
+#   Start app only:          docker-compose -f docker-compose-full.yml up -d pdf-compare-ui
+#   Rebuild app only:        docker-compose -f docker-compose-full.yml build pdf-compare-ui
+#   Stop Postgres:           docker-compose -f docker-compose-full.yml stop postgres
+#   Stop Ollama:             docker-compose -f docker-compose-full.yml stop ollama
+#
+# Or use the build.sh script for easier management!
+# ============================================================================
 
 services:
-  # PostgreSQL Database with PostGIS
+  # ========================================================================
+  # CONTAINER 1: PostgreSQL Database
+  # ========================================================================
+  # Uses pre-built image - no build needed, just pull and run
+  # Data persisted in 'postgres-data' volume
+  # Can be updated by pulling new image: docker pull postgis/postgis:16-3.4
   postgres:
     image: postgis/postgis:16-3.4
     container_name: pdf-compare-postgres
@@ -26,7 +50,12 @@ services:
     networks:
       - pdf-network
 
-  # Ollama Service for AI/LLM features
+  # ========================================================================
+  # CONTAINER 2: Ollama AI Service
+  # ========================================================================
+  # Uses pre-built image - no build needed, just pull and run
+  # Models persisted in 'ollama-data' volume (~4GB for llama3.2)
+  # Can be updated by pulling new image: docker pull ollama/ollama:latest
   ollama:
     image: ollama/ollama:latest
     container_name: pdf-compare-ollama
@@ -53,8 +82,11 @@ services:
     #           count: 1
     #           capabilities: [gpu]
 
-  # Model Initialization Container
-  # Pulls required models on first run
+  # ========================================================================
+  # Ollama Model Initialization (helper container)
+  # ========================================================================
+  # One-time container that downloads AI models
+  # Runs once then exits (restart: "no")
   ollama-init:
     image: ollama/ollama:latest
     container_name: pdf-compare-ollama-init
@@ -81,9 +113,24 @@ services:
         ollama list
     restart: "no"
 
-  # PDF Compare UI Container
+  # ========================================================================
+  # CONTAINER 3: PDF Compare Application
+  # ========================================================================
+  # Built from local Dockerfile - THIS IS WHAT YOU UPDATE FREQUENTLY
+  # Multi-stage build means only the 'app' layer rebuilds when code changes
+  # No dependencies layer rebuild = FAST updates (~30 seconds)
+  #
+  # To update this container:
+  #   1. Edit your code (ui/ or pdf_compare/ directories)
+  #   2. Run: ./build.sh app build
+  #   3. Run: ./build.sh app restart
+  #   4. Postgres and Ollama keep running!
   pdf-compare-ui:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    image: pdf-compare-ui:latest
     container_name: pdf-compare-ui
     ports:
       - "8501:8501"
@@ -124,12 +171,25 @@ services:
       timeout: 10s
       retries: 3
 
+# ============================================================================
+# Persistent Volumes
+# ============================================================================
+# These volumes persist data even when containers are stopped/removed
 volumes:
   postgres-data:
     driver: local
+    # Contains all PostgreSQL data
+    # Delete this volume to reset the database: docker volume rm postgres-data
+
   ollama-data:
     driver: local
+    # Contains downloaded AI models (~4GB)
+    # Delete this volume to re-download models: docker volume rm ollama-data
 
+# ============================================================================
+# Network
+# ============================================================================
+# All containers communicate via this bridge network
 networks:
   pdf-network:
     driver: bridge

@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database Container
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: pdf-compare-postgres
+    environment:
+      POSTGRES_DB: pdfcompare
+      POSTGRES_USER: pdfuser
+      POSTGRES_PASSWORD: pdfpassword
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdfuser -d pdfcompare"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - pdf-network
+
+  # Streamlit UI Container
+  pdf-compare-ui:
+    build: .
+    container_name: pdf-compare-ui
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data/uploads:/app/data/uploads
+      - ./data/outputs:/app/data/outputs
+    environment:
+      # Database connection
+      DATABASE_URL: postgresql://pdfuser:pdfpassword@postgres:5432/pdfcompare
+
+      # Performance settings
+      CPU_LIMIT: 15
+      PDF_MIN_SEGMENT_LEN: 0.50
+      PDF_MIN_FILL_AREA: 0.50
+      PDF_BEZIER_SAMPLES: 24
+
+      # Python settings
+      PYTHONUNBUFFERED: 1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    command: streamlit run ui/streamlit_app.py --server.address 0.0.0.0 --server.port 8501
+    networks:
+      - pdf-network
+    cpus: 16
+    mem_limit: 8g
+
+volumes:
+  postgres-data:
+    driver: local
+
+networks:
+  pdf-network:
+    driver: bridge
