@@ -43,6 +43,7 @@ Notes
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import time
@@ -79,6 +80,7 @@ try:
     from pdf_compare.compare_new import diff_documents
     from pdf_compare.overlay import write_overlay
     from pdf_compare.rag_simple import SimplePDFChat
+    from pdf_compare.analyzers.table_extractor import TableExtractor, TableExtractionConfig
     import fitz  # PyMuPDF
 except Exception as exc:  # pragma: no cover
     st.error(
@@ -151,33 +153,11 @@ def display_pdf(pdf_path: Path, *, height: int = 720) -> None:
         return
 
     b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
-
-    # Use PDF.js for more reliable rendering across browsers
-    pdf_display = f"""
-    <style>
-    .pdf-container {{
-        width: 100%;
-        height: {height}px;
-        border: 1px solid #ddd;
-        border-radius: 4px;
-        overflow: hidden;
-    }}
-    .pdf-object {{
-        width: 100%;
-        height: 100%;
-    }}
-    </style>
-    <div class="pdf-container">
-        <object
-            class="pdf-object"
-            data="data:application/pdf;base64,{b64_pdf}"
-            type="application/pdf">
-            <p>Your browser doesn't support embedded PDFs.
-               <a href="data:application/pdf;base64,{b64_pdf}" download="{pdf_path.name}">Download PDF</a> instead.</p>
-        </object>
-    </div>
-    """
-    components.html(pdf_display, height=height + 16, scrolling=True)
+    iframe = (
+        f'<iframe src="data:application/pdf;base64,{b64_pdf}" '
+        f'width="100%" height="{height}" type="application/pdf"></iframe>'
+    )
+    components.html(iframe, height=height + 16, scrolling=False)
 
 
 def get_rag_chat(doc_id: str, doc_path: Path, *, force_refresh: bool = False) -> "SimplePDFChat":
@@ -279,14 +259,36 @@ with workspace_tab:
                             )
 
                     if enable_ocr:
-                        vectormap = pdf_to_vectormap(
-                            str(target_path),
-                            workers=num_workers,
-                            enable_ocr=True,
-                        )
-                        if debug_mode:
-                            debug_messages.append(f"[{datetime.now():%H:%M:%S}] OCR-enabled extraction complete")
-                        page_progress_bar.progress(1.0, text="Extraction complete")
+                        # Try with requested workers, fallback to fewer workers if it crashes
+                        workers_to_try = [num_workers, max(1, num_workers // 2), 1]
+                        vectormap = None
+
+                        for attempt, worker_count in enumerate(workers_to_try, 1):
+                            try:
+                                if debug_mode and attempt > 1:
+                                    debug_messages.append(f"[{datetime.now():%H:%M:%S}] Retry {attempt} with {worker_count} worker(s)")
+
+                                vectormap = pdf_to_vectormap(
+                                    str(target_path),
+                                    workers=worker_count,
+                                    enable_ocr=True,
+                                )
+                                if debug_mode:
+                                    debug_messages.append(f"[{datetime.now():%H:%M:%S}] OCR-enabled extraction complete with {worker_count} worker(s)")
+                                page_progress_bar.progress(1.0, text="Extraction complete")
+                                break  # Success!
+
+                            except Exception as worker_exc:
+                                if debug_mode:
+                                    debug_messages.append(f"[{datetime.now():%H:%M:%S}] Extraction failed with {worker_count} workers: {worker_exc}")
+
+                                # If this was the last attempt, re-raise
+                                if attempt == len(workers_to_try):
+                                    raise worker_exc
+
+                                # Otherwise, warn and try again with fewer workers
+                                with status_container:
+                                    st.warning(f"Process pool crashed with {worker_count} workers. Retrying with {workers_to_try[attempt]}...")
                     else:
                         vectormap = pdf_to_vectormap_server(
                             str(target_path),
@@ -296,6 +298,9 @@ with workspace_tab:
 
                     if debug_mode:
                         debug_messages.append(f"[{datetime.now():%H:%M:%S}] Writing to database")
+
+                    if vectormap is None:
+                        raise RuntimeError("Failed to extract vectormap from PDF")
 
                     upsert_vectormap(backend, vectormap)
 
@@ -484,7 +489,308 @@ with workspace_tab:
             except Exception as exc:
                 st.error(f"Search error: {exc}")
 
-    st.subheader("4) Compare & Create Overlay")
+    st.subheader("4) Quick BOM Extract")
+    with st.expander("📋 Extract Parts List / BOM to CSV", expanded=False):
+        st.caption("Quickly extract Bill of Materials from your drawing and download as CSV")
+
+        if not docs:
+            st.info("No documents available. Please ingest documents first.")
+        else:
+            bom_doc = st.selectbox(
+                "Select drawing",
+                options=[f"{doc_id} - {Path(path).name}" for doc_id, path, _ in docs],
+                key="bom_doc_select"
+            )
+
+            col_bom_settings = st.columns(2)
+            with col_bom_settings[0]:
+                bom_dpi = st.select_slider("Quality", options=[200, 300, 400, 500], value=400, key="bom_dpi")
+            with col_bom_settings[1]:
+                bom_pages = st.text_input("Pages (e.g., 1 or 1,3,5)", value="1", key="bom_pages")
+
+            if st.button("Extract BOM to CSV", type="primary", key="quick_bom_btn"):
+                bom_doc_id = bom_doc.split(" - ", maxsplit=1)[0]
+                doc_info = next((d for d in docs if d[0] == bom_doc_id), None)
+
+                if not doc_info:
+                    st.error("Document not found")
+                else:
+                    _, doc_path, page_count = doc_info
+
+                    # Parse page numbers
+                    try:
+                        if bom_pages.strip():
+                            page_indices = [int(p.strip()) - 1 for p in bom_pages.split(",")]
+                        else:
+                            page_indices = [0]
+                    except ValueError:
+                        st.error("Invalid page numbers. Use format: 1 or 1,2,3")
+                        page_indices = None
+
+                    if page_indices is not None:
+                        with st.spinner("Extracting BOM from drawing..."):
+                            try:
+                                # Configure for BOM extraction
+                                config = TableExtractionConfig(
+                                    dpi=bom_dpi,
+                                    ocr_min_conf=40,
+                                    enable_line_detection=True,
+                                    enable_whitespace_detection=True,
+                                    bom_keywords=[
+                                        "PARTS LIST", "BILL OF MATERIALS", "BOM", "MATERIAL LIST",
+                                        "ITEM", "QTY", "QUANTITY", "PART NUMBER", "DESCRIPTION", "PART NO",
+                                        "PART#", "P/N", "PN", "MATL", "MATERIAL"
+                                    ]
+                                )
+
+                                # Extract tables
+                                extractor = TableExtractor(config)
+                                tables = extractor.extract_all_tables(doc_path, page_indices=page_indices)
+
+                                if not tables:
+                                    st.warning("No tables found on the selected page(s).")
+                                else:
+                                    # Get BOM tables
+                                    bom_tables = [t for t in tables if t.table_type == "bom"]
+
+                                    if not bom_tables:
+                                        st.warning(f"Found {len(tables)} table(s) but none identified as BOM. Showing all tables.")
+                                        bom_tables = tables
+
+                                    st.success(f"Found {len(bom_tables)} BOM table(s)")
+
+                                    # Create CSV
+                                    try:
+                                        import pandas as pd
+                                        import io
+
+                                        all_bom_rows = []
+                                        for table in bom_tables:
+                                            df = table.to_dataframe()
+                                            if not df.empty:
+                                                df.insert(0, "Page", table.page)
+                                                all_bom_rows.append(df)
+
+                                        if all_bom_rows:
+                                            combined_bom = pd.concat(all_bom_rows, ignore_index=True)
+
+                                            # Show preview
+                                            st.dataframe(combined_bom, use_container_width=True, height=300)
+
+                                            # Generate CSV
+                                            csv_buffer = io.StringIO()
+                                            combined_bom.to_csv(csv_buffer, index=False)
+                                            csv_data = csv_buffer.getvalue()
+
+                                            # Download button
+                                            filename = Path(doc_path).stem
+                                            st.download_button(
+                                                label="📥 Download BOM CSV",
+                                                data=csv_data,
+                                                file_name=f"{filename}_BOM.csv",
+                                                mime="text/csv",
+                                                type="primary",
+                                                key="download_bom_csv"
+                                            )
+
+                                            st.success(f"✅ BOM extracted: {len(combined_bom)} rows")
+                                        else:
+                                            st.error("No data extracted from tables")
+
+                                    except ImportError:
+                                        st.error("pandas is required for CSV export. Please rebuild Docker container.")
+                                    except Exception as e:
+                                        st.error(f"CSV generation failed: {e}")
+                                        import traceback
+                                        st.code(traceback.format_exc())
+
+                            except Exception as exc:
+                                st.error(f"BOM extraction failed: {exc}")
+                                import traceback
+                                st.code(traceback.format_exc())
+
+    st.subheader("5) Advanced Table Extraction")
+    with st.expander("Table extraction from drawings", expanded=False):
+        st.caption("Extract Bills of Materials, parts lists, symbol legends, and other tabular data from engineering drawings")
+
+        if not docs:
+            st.info("No documents available. Please ingest documents first.")
+        else:
+            col_table_doc, col_table_page = st.columns([3, 1])
+
+            with col_table_doc:
+                table_doc_options = [f"{doc_id} - {Path(path).name}" for doc_id, path, _ in docs]
+                selected_table_doc = st.selectbox(
+                    "Select document for table extraction",
+                    options=table_doc_options,
+                    key="table_doc_select"
+                )
+
+            with col_table_page:
+                extract_all_pages = st.checkbox("All pages", value=True, key="extract_all_pages")
+                if not extract_all_pages:
+                    page_for_table = st.number_input("Page number", min_value=1, value=1, key="table_page_num")
+
+            # Configuration options
+            with st.expander("Advanced settings", expanded=False):
+                col_dpi, col_thresh = st.columns(2)
+                with col_dpi:
+                    table_dpi = st.slider("Rendering DPI", 200, 600, 400, 50, help="Higher DPI improves OCR accuracy but takes longer")
+                with col_thresh:
+                    ocr_conf = st.slider("Minimum OCR confidence", 0, 100, 50, 5, help="Filter out low-confidence OCR results")
+
+            if st.button("Extract Tables", type="primary", key="extract_tables_btn"):
+                table_doc_id = selected_table_doc.split(" - ", maxsplit=1)[0]
+                doc_info = next((d for d in docs if d[0] == table_doc_id), None)
+
+                if not doc_info:
+                    st.error("Document not found")
+                else:
+                    _, doc_path, page_count = doc_info
+
+                    with st.spinner("Extracting tables from PDF..."):
+                        # Create config
+                        config = TableExtractionConfig(
+                            dpi=table_dpi,
+                            ocr_min_conf=ocr_conf
+                        )
+
+                        # Create extractor
+                        extractor = TableExtractor(config)
+
+                        # Extract tables
+                        page_indices = None if extract_all_pages else [page_for_table - 1]
+
+                        try:
+                            tables = extractor.extract_all_tables(doc_path, page_indices=page_indices)
+
+                            if not tables:
+                                st.warning("No tables detected in the selected pages.")
+                            else:
+                                st.success(f"Extracted {len(tables)} table(s)")
+
+                                # Store in session state
+                                st.session_state["_extracted_tables"] = tables
+                                st.session_state["_table_doc_path"] = doc_path
+                                st.session_state["_table_doc_id"] = table_doc_id
+
+                                # Display summary
+                                st.dataframe({
+                                    "Table ID": [t.table_id for t in tables],
+                                    "Type": [t.table_type for t in tables],
+                                    "Page": [t.page for t in tables],
+                                    "Rows": [len(t.rows) for t in tables],
+                                    "Columns": [len(t.headers) for t in tables],
+                                    "Detection": [t.metadata.get("detection_method", "unknown") for t in tables]
+                                }, use_container_width=True)
+
+                        except Exception as exc:
+                            st.error(f"Table extraction failed: {exc}")
+                            import traceback
+                            st.code(traceback.format_exc())
+
+            # Display extracted tables
+            if "_extracted_tables" in st.session_state and st.session_state["_extracted_tables"]:
+                st.markdown("---")
+                st.markdown("**Extracted Tables**")
+
+                tables = st.session_state["_extracted_tables"]
+
+                # Filter by table type
+                col_filter, col_export = st.columns([2, 1])
+                with col_filter:
+                    table_type_filter = st.selectbox(
+                        "Filter by type",
+                        options=["All", "BOM", "Symbols", "Line Types", "Generic"],
+                        key="table_type_filter"
+                    )
+
+                with col_export:
+                    export_format = st.radio("Export format", ["JSON", "CSV"], horizontal=True, key="table_export_format")
+
+                # Filter tables
+                filtered_tables = tables
+                if table_type_filter != "All":
+                    filter_map = {
+                        "BOM": "bom",
+                        "Symbols": "symbols",
+                        "Line Types": "line_types",
+                        "Generic": "generic"
+                    }
+                    filtered_tables = [t for t in tables if t.table_type == filter_map[table_type_filter]]
+
+                if not filtered_tables:
+                    st.info(f"No tables of type '{table_type_filter}' found.")
+                else:
+                    # Export buttons
+                    col_export_json, col_export_csv = st.columns(2)
+
+                    with col_export_json:
+                        if export_format == "JSON":
+                            json_data = json.dumps([t.to_dict() for t in filtered_tables], indent=2)
+                            st.download_button(
+                                "Download JSON",
+                                data=json_data,
+                                file_name=f"tables_{st.session_state['_table_doc_id']}.json",
+                                mime="application/json",
+                                key="download_tables_json"
+                            )
+
+                    with col_export_csv:
+                        if export_format == "CSV":
+                            try:
+                                import pandas as pd
+                                # Create a combined CSV with all tables
+                                all_rows = []
+                                for table in filtered_tables:
+                                    df = table.to_dataframe()
+                                    df.insert(0, "Table ID", table.table_id)
+                                    df.insert(1, "Table Type", table.table_type)
+                                    df.insert(2, "Page", table.page)
+                                    all_rows.append(df)
+
+                                if all_rows:
+                                    combined_df = pd.concat(all_rows, ignore_index=True)
+                                    csv_data = combined_df.to_csv(index=False)
+                                    st.download_button(
+                                        "Download CSV",
+                                        data=csv_data,
+                                        file_name=f"tables_{st.session_state['_table_doc_id']}.csv",
+                                        mime="text/csv",
+                                        key="download_tables_csv"
+                                    )
+                            except ImportError:
+                                st.warning("pandas not installed. CSV export unavailable.")
+
+                    # Display each table
+                    for table in filtered_tables:
+                        with st.expander(f"{table.table_id} - {table.table_type.upper()} (Page {table.page})", expanded=True):
+                            st.caption(f"Detection method: {table.metadata.get('detection_method', 'unknown')}")
+
+                            # Display headers
+                            if table.headers:
+                                st.markdown("**Headers:**")
+                                st.write(", ".join(table.headers))
+
+                            # Display table content as dataframe
+                            if table.rows:
+                                try:
+                                    df = table.to_dataframe()
+                                    st.dataframe(df, use_container_width=True, height=min(400, len(df) * 35 + 38))
+                                except ImportError:
+                                    # Fallback: display as dict
+                                    st.json(table.to_dict())
+                            else:
+                                st.info("No rows in table")
+
+                            # Show raw cell data
+                            with st.expander("View raw cell data", expanded=False):
+                                for row in table.rows[:5]:  # Show first 5 rows
+                                    st.write(f"**Row {row.row_index}:**")
+                                    for cell in row.cells:
+                                        st.text(f"  Col {cell.col}: '{cell.text}' (conf: {cell.confidence:.1f}%)")
+
+    st.subheader("6) Compare & Create Overlay")
     if len(docs) >= 2:
         col_old, col_new = st.columns(2)
         with col_old:
