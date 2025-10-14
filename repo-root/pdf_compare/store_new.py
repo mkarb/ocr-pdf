@@ -74,5 +74,68 @@ def list_documents(conn_or_backend: Union[DatabaseBackend, any]) -> List[Tuple[s
         return legacy_list(conn_or_backend)
 
 
+def delete_document(conn_or_backend: Union[DatabaseBackend, any], doc_id: str) -> bool:
+    """
+    Delete a document and all its associated data from the database.
+
+    Args:
+        conn_or_backend: DatabaseBackend instance or legacy sqlite3.Connection
+        doc_id: Document ID to delete
+
+    Returns:
+        True if document was deleted, False if not found
+    """
+    if isinstance(conn_or_backend, DatabaseBackend):
+        return conn_or_backend.delete_document(doc_id)
+    else:
+        # Legacy sqlite3 connection - not implemented
+        raise NotImplementedError("delete_document not supported for legacy SQLite connections")
+
+
+def delete_all_documents(conn_or_backend: Union[DatabaseBackend, any]) -> int:
+    """
+    Delete all documents from the database.
+
+    Args:
+        conn_or_backend: DatabaseBackend instance or legacy sqlite3.Connection
+
+    Returns:
+        Number of documents deleted
+    """
+    if isinstance(conn_or_backend, DatabaseBackend):
+        return conn_or_backend.delete_all_documents()
+    else:
+        # Legacy sqlite3 connection - not implemented
+        raise NotImplementedError("delete_all_documents not supported for legacy SQLite connections")
+
+
+def export_document_text(conn_or_backend: Union[DatabaseBackend, any], doc_id: str, format: str = "txt") -> str:
+    """
+    Export all text content from a document for debugging.
+
+    Args:
+        conn_or_backend: DatabaseBackend instance
+        doc_id: Document ID to export
+        format: Output format ("txt" or "json")
+
+    Returns:
+        Formatted text content
+    """
+    if isinstance(conn_or_backend, DatabaseBackend):
+        return conn_or_backend.export_document_text(doc_id, format)
+    else:
+        raise NotImplementedError("export_document_text not supported for legacy SQLite connections")
+
+
+def get_document_text_with_coords(conn_or_backend: Union[DatabaseBackend, any], doc_id: str):
+    """
+    Get all text with coordinates for creating searchable PDFs.
+    """
+    if isinstance(conn_or_backend, DatabaseBackend):
+        return conn_or_backend.get_document_text_with_coords(doc_id)
+    else:
+        raise NotImplementedError("get_document_text_with_coords not supported for legacy")
+
+
 # Export backwards-compatible API
-__all__ = ["open_db", "upsert_vectormap", "list_documents", "DatabaseBackend"]
+__all__ = ["open_db", "upsert_vectormap", "list_documents", "delete_document", "delete_all_documents", "export_document_text", "get_document_text_with_coords", "DatabaseBackend"]

@@ -44,10 +44,23 @@ def _ocr_tile(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
     {"text": str, "bbox": (x0,y0,x1,y1), "conf": int}
     (bbox is in TILE pixel coords; caller maps to PDF coords)
     """
-    # Slight denoise/contrast helps on engineering drawings
-    proc = cv2.GaussianBlur(gray, (3,3), 0)
+    # Enhanced preprocessing for engineering drawings
+    # 1. Denoise with bilateral filter (preserves edges better than Gaussian)
+    proc = cv2.bilateralFilter(gray, 9, 75, 75)
+
+    # 2. Adaptive thresholding for varying lighting/contrast
+    proc = cv2.adaptiveThreshold(
+        proc, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
+
+    # 3. Morphological operations to clean up thin lines and connect broken characters
+    kernel = np.ones((2,2), np.uint8)
+    proc = cv2.morphologyEx(proc, cv2.MORPH_CLOSE, kernel)
+
     # Use image_to_data to get boxes + confidences
-    ts_cfg = f"-l {cfg.lang} --psm {cfg.psm}"
+    # Add OEM 3 (Default, LSTM) for better accuracy
+    ts_cfg = f"-l {cfg.lang} --psm {cfg.psm} --oem 3"
     data = pytesseract.image_to_data(proc, config=ts_cfg, output_type=pytesseract.Output.DICT)
     out = []
     n = len(data.get("text", []))

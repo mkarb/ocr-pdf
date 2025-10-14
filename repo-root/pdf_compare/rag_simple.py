@@ -5,6 +5,7 @@ Simplified version optimized for symbol recognition and diagram analysis.
 
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+import os
 import json
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -23,7 +24,8 @@ class SimplePDFChat:
         self,
         pdf_path: str,
         llm_model: str = "llama3.2",
-        embed_model: str = "nomic-embed-text"
+        embed_model: str = "nomic-embed-text",
+        base_url: Optional[str] = None,
     ):
         """
         Initialize PDF chatbot.
@@ -34,6 +36,7 @@ class SimplePDFChat:
             embed_model: Ollama embedding model name
         """
         self.pdf_path = pdf_path
+        self.base_url = base_url or os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434"
 
         # Load PDF
         print(f"Loading PDF: {pdf_path}")
@@ -51,14 +54,14 @@ class SimplePDFChat:
 
         # Create embeddings
         print("Creating embeddings...")
-        embeddings = OllamaEmbeddings(model=embed_model)
+        embeddings = OllamaEmbeddings(model=embed_model, base_url=self.base_url)
 
         # Create vector store
         self.vector_store = FAISS.from_documents(self.chunks, embeddings)
         print("Vector store created")
 
         # Create LLM
-        self.llm = Ollama(model=llm_model)
+        self.llm = Ollama(model=llm_model, base_url=self.base_url)
 
         # Create retrieval chain
         self.qa_chain = RetrievalQA.from_chain_type(
@@ -135,7 +138,8 @@ class SymbolComparator:
         self,
         pdf1_path: str,
         pdf2_path: str,
-        llm_model: str = "llama3.2"
+        llm_model: str = "llama3.2",
+        base_url: Optional[str] = None
     ):
         """
         Initialize symbol comparator.
@@ -145,9 +149,10 @@ class SymbolComparator:
             pdf2_path: Path to second PDF (new version)
             llm_model: Ollama model to use
         """
-        self.llm = Ollama(model=llm_model)
-        self.pdf1_chat = SimplePDFChat(pdf1_path, llm_model)
-        self.pdf2_chat = SimplePDFChat(pdf2_path, llm_model)
+        self.base_url = base_url or os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434"
+        self.llm = Ollama(model=llm_model, base_url=self.base_url)
+        self.pdf1_chat = SimplePDFChat(pdf1_path, llm_model, base_url=self.base_url)
+        self.pdf2_chat = SimplePDFChat(pdf2_path, llm_model, base_url=self.base_url)
 
         # Extract legends from both
         print("Extracting legends...")
@@ -231,7 +236,7 @@ class SymbolComparator:
 
 
 # Quick helper functions
-def chat_with_pdf(pdf_path: str) -> SimplePDFChat:
+def chat_with_pdf(pdf_path: str, *, base_url: Optional[str] = None) -> SimplePDFChat:
     """
     Quick setup to chat with a PDF.
 
@@ -245,10 +250,10 @@ def chat_with_pdf(pdf_path: str) -> SimplePDFChat:
         >>> chat = chat_with_pdf("diagram.pdf")
         >>> print(chat.ask("What symbols are in the legend?"))
     """
-    return SimplePDFChat(pdf_path)
+    return SimplePDFChat(pdf_path, base_url=base_url)
 
 
-def compare_pdfs(old_pdf: str, new_pdf: str) -> SymbolComparator:
+def compare_pdfs(old_pdf: str, new_pdf: str, *, base_url: Optional[str] = None) -> SymbolComparator:
     """
     Quick setup to compare two PDFs.
 
@@ -263,10 +268,10 @@ def compare_pdfs(old_pdf: str, new_pdf: str) -> SymbolComparator:
         >>> comp = compare_pdfs("old.pdf", "new.pdf")
         >>> print(comp.compare_symbols())
     """
-    return SymbolComparator(old_pdf, new_pdf)
+    return SymbolComparator(old_pdf, new_pdf, base_url=base_url)
 
 
-def interactive_pdf_chat(pdf_path: str):
+def interactive_pdf_chat(pdf_path: str, *, base_url: Optional[str] = None):
     """
     Interactive command-line chat with a PDF.
 
@@ -278,7 +283,7 @@ def interactive_pdf_chat(pdf_path: str):
         Ask a question (or 'quit'): What valves are shown?
         Answer: The document shows...
     """
-    chat = SimplePDFChat(pdf_path)
+    chat = SimplePDFChat(pdf_path, base_url=base_url)
 
     print(f"\nChatting with: {pdf_path}")
     print("Type 'quit' to exit\n")

@@ -8,7 +8,7 @@
 # ==============================================================================
 FROM python:3.11-slim AS base
 
-# Install system dependencies for PyMuPDF, Tesseract OCR, Shapely, and RAG features
+# Install system dependencies for PyMuPDF, Tesseract OCR, OpenCV, Shapely, and RAG features
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y \
     sqlite3 \
     libsqlite3-dev \
     curl \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
