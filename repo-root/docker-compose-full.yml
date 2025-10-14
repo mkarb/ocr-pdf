@@ -139,7 +139,7 @@ services:
       - ./data/outputs:/app/data/outputs
     environment:
       # Database connection
-      DATABASE_URL: postgresql://pdfuser:pdfpassword@postgres:5432/pdfcompare
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       APP_DATA_DIR: /app/data
 
       # Ollama connection
