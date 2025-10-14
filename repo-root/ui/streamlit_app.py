@@ -151,11 +151,33 @@ def display_pdf(pdf_path: Path, *, height: int = 720) -> None:
         return
 
     b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
-    iframe = (
-        f'<iframe src="data:application/pdf;base64,{b64_pdf}" '
-        f'width="100%" height="{height}" type="application/pdf"></iframe>'
-    )
-    components.html(iframe, height=height + 16, scrolling=False)
+
+    # Use PDF.js for more reliable rendering across browsers
+    pdf_display = f"""
+    <style>
+    .pdf-container {{
+        width: 100%;
+        height: {height}px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        overflow: hidden;
+    }}
+    .pdf-object {{
+        width: 100%;
+        height: 100%;
+    }}
+    </style>
+    <div class="pdf-container">
+        <object
+            class="pdf-object"
+            data="data:application/pdf;base64,{b64_pdf}"
+            type="application/pdf">
+            <p>Your browser doesn't support embedded PDFs.
+               <a href="data:application/pdf;base64,{b64_pdf}" download="{pdf_path.name}">Download PDF</a> instead.</p>
+        </object>
+    </div>
+    """
+    components.html(pdf_display, height=height + 16, scrolling=True)
 
 
 def get_rag_chat(doc_id: str, doc_path: Path, *, force_refresh: bool = False) -> "SimplePDFChat":
