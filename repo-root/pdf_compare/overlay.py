@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import List, Dict, Optional, Tuple
 import os
+import sys
 import fitz
 
 def _try_strip_layers_with_pikepdf(src_pdf: str) -> Optional[str]:
@@ -174,12 +175,10 @@ def create_searchable_pdf(
                 )
             except Exception as e:
                 # If text insertion fails (e.g., special characters), skip it
-                import sys
                 print(f"Warning: Failed to insert text '{text}' at page {page_num+1}: {e}", file=sys.stderr)
                 continue
 
     # Ensure output directory exists
-    import os
     output_dir = os.path.dirname(output_pdf_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
