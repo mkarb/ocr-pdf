@@ -1,0 +1,85 @@
+# Prometheus configuration for PDF Compare monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'pdf-compare-cluster'
+    environment: 'production'
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # PostgreSQL Primary
+  - job_name: 'postgres-primary'
+    static_configs:
+      - targets: ['postgres-primary:5432']
+        labels:
+          role: 'primary'
+          service: 'database'
+
+  # PostgreSQL Replicas
+  - job_name: 'postgres-replicas'
+    static_configs:
+      - targets:
+          - 'postgres-replica-1:5432'
+          - 'postgres-replica-2:5432'
+        labels:
+          role: 'replica'
+          service: 'database'
+
+  # PgBouncer
+  - job_name: 'pgbouncer'
+    static_configs:
+      - targets: ['pgbouncer:6432']
+        labels:
+          service: 'connection-pooling'
+
+  # Nginx Load Balancer
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['nginx:80']
+        labels:
+          service: 'load-balancer'
+    metrics_path: '/nginx_status'
+
+  # Streamlit instances (discovered dynamically)
+  - job_name: 'streamlit'
+    dns_sd_configs:
+      - names: ['pdf-compare-ui']
+        type: 'A'
+        port: 8501
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - source_labels: [__address__]
+        target_label: __address__
+        replacement: '${1}:8501'
+
+  # Ollama AI service
+  - job_name: 'ollama'
+    static_configs:
+      - targets: ['ollama:11434']
+        labels:
+          service: 'ai'
+
+  # Redis (if using for session storage)
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+        labels:
+          service: 'cache'
+
+# Rule files for alerts
+rule_files:
+  # - 'alerts.yml'

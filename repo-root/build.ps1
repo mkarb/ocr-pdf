@@ -163,6 +163,66 @@ switch ($Mode) {
         }
     }
 
+    "scaled" {
+        Write-Log "Building scaled deployment (Simplified Multi-User for 7-20 Users)"
+
+        if (-not (Test-Path ".env")) {
+            Write-Warn ".env file not found. Creating from template..."
+            Copy-Item ".env.scaled" ".env"
+            Write-Warn "IMPORTANT: Edit .env and set your passwords before starting!"
+            Write-Info "Use: notepad .env"
+            Start-Sleep -Seconds 2
+        }
+
+        docker-compose -f docker-compose-scaled.yml build
+
+        if ($Action -eq "up") {
+            Write-Log "Starting scaled deployment..."
+            Write-Info "This includes:"
+            Write-Info "  - Nginx Load Balancer (sticky sessions)"
+            Write-Info "  - Multiple Streamlit instances (2-3 by default)"
+            Write-Info "  - PostgreSQL Database (100+ connection capacity)"
+            Write-Info "  - Ollama AI Service"
+            Write-Info "  - Redis Cache"
+            Write-Info "  - Prometheus + Grafana Monitoring"
+            Write-Host ""
+
+            $instances = if ($Options) { $Options } else { "2" }
+            Write-Log "Scaling to $instances Streamlit instances..."
+            docker-compose -f docker-compose-scaled.yml up -d --scale pdf-compare-ui=$instances
+
+            Write-Host ""
+            Write-Info "===== ACCESS POINTS ====="
+            Write-Info "Application:  http://localhost"
+            Write-Info "Grafana:      http://localhost:3000 (admin/password from .env)"
+            Write-Info "Prometheus:   http://localhost:9090"
+            Write-Host ""
+            Write-Info "Wait 1-2 minutes for models to download (first time only)"
+        }
+        elseif ($Action -eq "down") {
+            Write-Log "Stopping scaled deployment..."
+            docker-compose -f docker-compose-scaled.yml down
+            Write-Info "Scaled deployment stopped (data preserved)"
+        }
+        elseif ($Action -eq "restart") {
+            Write-Log "Restarting scaled deployment..."
+            docker-compose -f docker-compose-scaled.yml restart
+            Write-Info "Scaled deployment restarted"
+        }
+        elseif ($Action -eq "scale") {
+            $instances = if ($Options) { $Options } else { "5" }
+            Write-Log "Scaling to $instances Streamlit instances..."
+            docker-compose -f docker-compose-scaled.yml up -d --scale pdf-compare-ui=$instances
+            Write-Info "Scaled to $instances instances"
+        }
+        elseif ($Action -eq "logs") {
+            docker-compose -f docker-compose-scaled.yml logs -f
+        }
+        elseif ($Action -eq "ps") {
+            docker-compose -f docker-compose-scaled.yml ps
+        }
+    }
+
     "multi-user" {
         Write-Log "Building multi-user containers (UI + worker)"
         docker-compose --profile multi-user build
@@ -224,7 +284,10 @@ switch ($Mode) {
         Write-Host "Usage: .\build.ps1 <mode> <action> [options]" -ForegroundColor White
         Write-Host ""
         Write-Host "=== CONTAINER MODES ===" -ForegroundColor Yellow
-        Write-Host "Full Stack:" -ForegroundColor White
+        Write-Host "Production (Multi-User):" -ForegroundColor White
+        Write-Host "  scaled         Scaled deployment for 7-20 concurrent users (Load Balancer)"
+        Write-Host ""
+        Write-Host "Development:" -ForegroundColor White
         Write-Host "  full           Full deployment (Postgres + Ollama + UI)"
         Write-Host "  standalone     Single container (UI + processing, no DB)"
         Write-Host ""
@@ -234,9 +297,9 @@ switch ($Mode) {
         Write-Host "  app            Application (UI + PDF Compare code) only"
         Write-Host "  infra          Both Postgres + Ollama together"
         Write-Host ""
-        Write-Host "Multi-User:" -ForegroundColor White
-        Write-Host "  multi-user     Separate UI and worker containers"
-        Write-Host "  worker         Worker containers only"
+        Write-Host "Legacy Multi-User:" -ForegroundColor White
+        Write-Host "  multi-user     Separate UI and worker containers (deprecated)"
+        Write-Host "  worker         Worker containers only (deprecated)"
         Write-Host ""
         Write-Host "Management:" -ForegroundColor White
         Write-Host "  clean          Stop and remove all containers"
@@ -253,7 +316,15 @@ switch ($Mode) {
         Write-Host ""
         Write-Host "=== EXAMPLES ===" -ForegroundColor Yellow
         Write-Host ""
-        Write-Host "Initial Setup (First Time):" -ForegroundColor Cyan
+        Write-Host "Production Multi-User Deployment:" -ForegroundColor Cyan
+        Write-Host "  .\build.ps1 scaled up                  # Start scaled deployment (7-20 users)" -ForegroundColor White
+        Write-Host "  .\build.ps1 scaled up 3                # Start with 3 UI instances" -ForegroundColor White
+        Write-Host "  .\build.ps1 scaled scale 5             # Scale to 5 UI instances" -ForegroundColor White
+        Write-Host "  .\build.ps1 scaled logs                # View all logs" -ForegroundColor White
+        Write-Host "  .\build.ps1 scaled ps                  # Show all containers" -ForegroundColor White
+        Write-Host "  .\build.ps1 scaled down                # Stop scaled deployment" -ForegroundColor White
+        Write-Host ""
+        Write-Host "Initial Setup (First Time - Development):" -ForegroundColor Cyan
         Write-Host "  .\build.ps1 full up                    # Start everything" -ForegroundColor White
         Write-Host ""
         Write-Host "Daily Development (Fast Updates):" -ForegroundColor Cyan
