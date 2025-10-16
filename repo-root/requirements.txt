@@ -18,7 +18,7 @@ pandas>=2.0.0,<3.0  # Data manipulation and CSV export for table extraction
 # PDF layer manipulation (for overlay fallback)
 pikepdf>=8.0.0,<10.0
 
-# Database: SQLAlchemy with PostgreSQL and SQLite support
+# Database: SQLAlchemy with PostgreSQL support (production database)
 sqlalchemy>=2.0.0,<2.1
 alembic>=1.13.0,<1.14
 psycopg2-binary>=2.9.0,<3.0
@@ -38,6 +38,5 @@ pypdf>=3.17.0,<5.0
 tiktoken>=0.5.0,<0.8
 faiss-cpu>=1.7.4,<1.9  # Vector similarity search (CPU-only)
 
-# Optional: if your Python build's SQLite lacks FTS5, uncomment ONE of these:
-# pysqlite3-binary>=0.5.2.post3
-# apsw>=3.45.1.0
+# Note: SQLite support has been removed. This project requires PostgreSQL.
+# For local development, you can use Docker Compose to run a PostgreSQL instance.

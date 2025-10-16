@@ -508,7 +508,7 @@ docker exec pdf-compare-ollama ollama pull llama3.2:1b
 pdf-compare/
 ├── pdf_compare/              # Core library
 │   ├── pdf_extract_server.py # Multi-core extraction
-│   ├── raster_grid_improved.py # Optimized raster diff
+│   ├── raster_grid.py # Optimized raster diff
 │   ├── rag_simple.py         # AI/RAG integration
 │   └── db_backend.py         # Database abstraction
 ├── ui/                       # Streamlit web interface

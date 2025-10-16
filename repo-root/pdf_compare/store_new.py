@@ -1,11 +1,11 @@
 """
-New database store with SQLAlchemy backend support.
-Provides backwards-compatible API with both SQLite and PostgreSQL support.
+PostgreSQL database store with SQLAlchemy backend.
+Provides a clean API for storing and retrieving PDF vector data.
 """
 
 from __future__ import annotations
 import os
-from typing import List, Tuple, Union
+from typing import List, Tuple
 from .models import VectorMap
 from .db_backend import DatabaseBackend, create_backend
 
@@ -16,23 +16,25 @@ _backend: DatabaseBackend | None = None
 
 def open_db(database_url: str) -> DatabaseBackend:
     """
-    Open database connection with SQLAlchemy backend.
+    Open PostgreSQL database connection with SQLAlchemy backend.
 
     Args:
-        database_url: Database URL string
-            - SQLite (legacy): Pass file path, will convert to sqlite:///path
-            - SQLite (explicit): "sqlite:///path/to/file.db"
-            - PostgreSQL: "postgresql://user:pass@host:port/dbname"
+        database_url: PostgreSQL connection string
+            Format: "postgresql://user:pass@host:port/dbname"
 
     Returns:
         DatabaseBackend instance
+
+    Raises:
+        ValueError: If database_url is not a PostgreSQL URL
     """
     global _backend
 
-    # Handle legacy file path format
-    if not database_url.startswith(("sqlite://", "postgresql://")):
-        # Convert file path to SQLite URL
-        database_url = f"sqlite:///{database_url}"
+    # Validate PostgreSQL URL
+    if not database_url.startswith("postgresql://"):
+        raise ValueError(
+            f"Invalid database URL. Expected PostgreSQL URL (postgresql://...), got: {database_url[:20]}..."
+        )
 
     # Create backend if needed
     if _backend is None or _backend.database_url != database_url:
@@ -43,99 +45,94 @@ def open_db(database_url: str) -> DatabaseBackend:
     return _backend
 
 
-def upsert_vectormap(conn_or_backend: Union[DatabaseBackend, any], vm: VectorMap) -> None:
+def upsert_vectormap(backend: DatabaseBackend, vm: VectorMap) -> None:
     """
     Store a VectorMap into the database.
 
     Args:
-        conn_or_backend: DatabaseBackend instance or legacy sqlite3.Connection
+        backend: DatabaseBackend instance
         vm: VectorMap to store
     """
-    if isinstance(conn_or_backend, DatabaseBackend):
-        conn_or_backend.upsert_vectormap(vm)
-    else:
-        # Legacy sqlite3 connection - import old implementation
-        from .store import upsert_vectormap as legacy_upsert
-        legacy_upsert(conn_or_backend, vm)
+    backend.upsert_vectormap(vm)
 
 
-def list_documents(conn_or_backend: Union[DatabaseBackend, any]) -> List[Tuple[str, str, int]]:
+def list_documents(backend: DatabaseBackend) -> List[Tuple[str, str, int]]:
     """
     List all documents in the database.
+
+    Args:
+        backend: DatabaseBackend instance
 
     Returns:
         List of (doc_id, path, page_count) tuples
     """
-    if isinstance(conn_or_backend, DatabaseBackend):
-        return conn_or_backend.list_documents()
-    else:
-        # Legacy sqlite3 connection
-        from .store import list_documents as legacy_list
-        return legacy_list(conn_or_backend)
+    return backend.list_documents()
 
 
-def delete_document(conn_or_backend: Union[DatabaseBackend, any], doc_id: str) -> bool:
+def delete_document(backend: DatabaseBackend, doc_id: str) -> bool:
     """
     Delete a document and all its associated data from the database.
 
     Args:
-        conn_or_backend: DatabaseBackend instance or legacy sqlite3.Connection
+        backend: DatabaseBackend instance
         doc_id: Document ID to delete
 
     Returns:
         True if document was deleted, False if not found
     """
-    if isinstance(conn_or_backend, DatabaseBackend):
-        return conn_or_backend.delete_document(doc_id)
-    else:
-        # Legacy sqlite3 connection - not implemented
-        raise NotImplementedError("delete_document not supported for legacy SQLite connections")
+    return backend.delete_document(doc_id)
 
 
-def delete_all_documents(conn_or_backend: Union[DatabaseBackend, any]) -> int:
+def delete_all_documents(backend: DatabaseBackend) -> int:
     """
     Delete all documents from the database.
 
     Args:
-        conn_or_backend: DatabaseBackend instance or legacy sqlite3.Connection
+        backend: DatabaseBackend instance
 
     Returns:
         Number of documents deleted
     """
-    if isinstance(conn_or_backend, DatabaseBackend):
-        return conn_or_backend.delete_all_documents()
-    else:
-        # Legacy sqlite3 connection - not implemented
-        raise NotImplementedError("delete_all_documents not supported for legacy SQLite connections")
+    return backend.delete_all_documents()
 
 
-def export_document_text(conn_or_backend: Union[DatabaseBackend, any], doc_id: str, format: str = "txt") -> str:
+def export_document_text(backend: DatabaseBackend, doc_id: str, format: str = "txt") -> str:
     """
     Export all text content from a document for debugging.
 
     Args:
-        conn_or_backend: DatabaseBackend instance
+        backend: DatabaseBackend instance
         doc_id: Document ID to export
         format: Output format ("txt" or "json")
 
     Returns:
         Formatted text content
     """
-    if isinstance(conn_or_backend, DatabaseBackend):
-        return conn_or_backend.export_document_text(doc_id, format)
-    else:
-        raise NotImplementedError("export_document_text not supported for legacy SQLite connections")
+    return backend.export_document_text(doc_id, format)
 
 
-def get_document_text_with_coords(conn_or_backend: Union[DatabaseBackend, any], doc_id: str):
+def get_document_text_with_coords(backend: DatabaseBackend, doc_id: str):
     """
     Get all text with coordinates for creating searchable PDFs.
+
+    Args:
+        backend: DatabaseBackend instance
+        doc_id: Document ID
+
+    Returns:
+        List of (page_number, text, (x0,y0,x1,y1), source) tuples
     """
-    if isinstance(conn_or_backend, DatabaseBackend):
-        return conn_or_backend.get_document_text_with_coords(doc_id)
-    else:
-        raise NotImplementedError("get_document_text_with_coords not supported for legacy")
+    return backend.get_document_text_with_coords(doc_id)
 
 
-# Export backwards-compatible API
-__all__ = ["open_db", "upsert_vectormap", "list_documents", "delete_document", "delete_all_documents", "export_document_text", "get_document_text_with_coords", "DatabaseBackend"]
+# Export public API
+__all__ = [
+    "open_db",
+    "upsert_vectormap",
+    "list_documents",
+    "delete_document",
+    "delete_all_documents",
+    "export_document_text",
+    "get_document_text_with_coords",
+    "DatabaseBackend",
+]

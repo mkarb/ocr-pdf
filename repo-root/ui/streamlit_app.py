@@ -54,6 +54,8 @@ from typing import Dict, List, Optional, Tuple
 import streamlit as st
 import streamlit.components.v1 as components
 
+from streamlit_session_manager import SessionManager, init_session
+
 try:
     import psutil  # type: ignore
     HAS_PSUTIL = True
@@ -91,6 +93,15 @@ except Exception as exc:  # pragma: no cover
 
 st.set_page_config(page_title="PDF Revision Diff (Local)", layout="wide")
 
+init_session()
+SessionManager.initialize_defaults({
+    "rag_chat_cache": {},
+    "rag_histories": {},
+    "extracted_tables": [],
+    "last_diffs": [],
+    "last_pair": None,
+})
+
 # Sidebar configuration
 st.sidebar.header("Configuration")
 
@@ -107,6 +118,20 @@ st.sidebar.success("PostgreSQL connected")
 if "@" in DATABASE_URL:
     display_url = DATABASE_URL.split("@", maxsplit=1)[1]
     st.sidebar.caption(f"Host: `{display_url}`")
+
+READ_REPLICA_URLS: List[str] = []
+single_replica = os.getenv("DATABASE_READ_URL")
+if single_replica:
+    READ_REPLICA_URLS.append(single_replica)
+
+idx = 1
+while True:
+    env_key = f"DATABASE_READ_URL_{idx}"
+    replica_url = os.getenv(env_key)
+    if not replica_url:
+        break
+    READ_REPLICA_URLS.append(replica_url)
+    idx += 1
 
 default_data_root = Path.cwd() / "data"
 data_root = Path(os.getenv("APP_DATA_DIR", default_data_root))
@@ -134,7 +159,7 @@ if HAS_PSUTIL:
 
 @st.cache_resource(show_spinner=False)
 def get_db_backend() -> DatabaseBackend:
-    return DatabaseBackend(DATABASE_URL)
+    return DatabaseBackend(DATABASE_URL, read_replica_urls=READ_REPLICA_URLS)
 
 
 def get_conn() -> DatabaseBackend:
@@ -161,7 +186,11 @@ def display_pdf(pdf_path: Path, *, height: int = 720) -> None:
 
 
 def get_rag_chat(doc_id: str, doc_path: Path, *, force_refresh: bool = False) -> "SimplePDFChat":
-    cache: Dict[str, Dict[str, object]] = st.session_state.setdefault("_rag_chat_cache", {})
+    cache = SessionManager.get_user_state("rag_chat_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        SessionManager.set_user_state("rag_chat_cache", cache)
+
     if not force_refresh:
         entry = cache.get(doc_id)
         if entry and entry.get("path") == str(doc_path):
@@ -171,13 +200,15 @@ def get_rag_chat(doc_id: str, doc_path: Path, *, force_refresh: bool = False) ->
 
     chat = SimplePDFChat(str(doc_path))
     cache[doc_id] = {"chat": chat, "path": str(doc_path)}
+    SessionManager.set_user_state("rag_chat_cache", cache)
     return chat
 
 
 def reset_rag_chat(doc_id: str) -> None:
-    cache = st.session_state.get("_rag_chat_cache")
+    cache = SessionManager.get_user_state("rag_chat_cache")
     if isinstance(cache, dict) and doc_id in cache:
         cache.pop(doc_id, None)
+        SessionManager.set_user_state("rag_chat_cache", cache)
 
 
 st.title("PDF Revision Diff - Local UI")
@@ -669,10 +700,10 @@ with workspace_tab:
                             else:
                                 st.success(f"Extracted {len(tables)} table(s)")
 
-                                # Store in session state
-                                st.session_state["_extracted_tables"] = tables
-                                st.session_state["_table_doc_path"] = doc_path
-                                st.session_state["_table_doc_id"] = table_doc_id
+                                # Store in per-session state
+                                SessionManager.set_user_state("extracted_tables", tables)
+                                SessionManager.set_user_state("table_doc_path", str(doc_path))
+                                SessionManager.set_user_state("table_doc_id", table_doc_id)
 
                                 # Display summary
                                 st.dataframe({
@@ -690,11 +721,13 @@ with workspace_tab:
                             st.code(traceback.format_exc())
 
             # Display extracted tables
-            if "_extracted_tables" in st.session_state and st.session_state["_extracted_tables"]:
+            tables = SessionManager.get_user_state("extracted_tables")
+            if tables:
                 st.markdown("---")
                 st.markdown("**Extracted Tables**")
 
-                tables = st.session_state["_extracted_tables"]
+                table_doc_id = SessionManager.get_user_state("table_doc_id") or "document"
+                safe_doc_id = str(table_doc_id)
 
                 # Filter by table type
                 col_filter, col_export = st.columns([2, 1])
@@ -731,7 +764,7 @@ with workspace_tab:
                             st.download_button(
                                 "Download JSON",
                                 data=json_data,
-                                file_name=f"tables_{st.session_state['_table_doc_id']}.json",
+                                file_name=f"tables_{safe_doc_id}.json",
                                 mime="application/json",
                                 key="download_tables_json"
                             )
@@ -755,7 +788,7 @@ with workspace_tab:
                                     st.download_button(
                                         "Download CSV",
                                         data=csv_data,
-                                        file_name=f"tables_{st.session_state['_table_doc_id']}.csv",
+                                        file_name=f"tables_{safe_doc_id}.csv",
                                         mime="text/csv",
                                         key="download_tables_csv"
                                     )
@@ -790,64 +823,67 @@ with workspace_tab:
                                     for cell in row.cells:
                                         st.text(f"  Col {cell.col}: '{cell.text}' (conf: {cell.confidence:.1f}%)")
 
-    st.subheader("6) Compare & Create Overlay")
-    if len(docs) >= 2:
-        col_old, col_new = st.columns(2)
-        with col_old:
-            old_choice = st.selectbox("Old document (baseline)", [f"{d[0]} - {Path(d[1]).name}" for d in docs])
-        with col_new:
-            new_choice = st.selectbox(
-                "New document (revised)",
-                [f"{d[0]} - {Path(d[1]).name}" for d in docs],
-                index=1 if len(docs) > 1 else 0,
+st.subheader("6) Compare & Create Overlay")
+if len(docs) >= 2:
+    col_old, col_new = st.columns(2)
+    with col_old:
+        old_choice = st.selectbox("Old document (baseline)", [f"{d[0]} - {Path(d[1]).name}" for d in docs])
+    with col_new:
+        new_choice = st.selectbox(
+            "New document (revised)",
+            [f"{d[0]} - {Path(d[1]).name}" for d in docs],
+            index=1 if len(docs) > 1 else 0,
+        )
+
+    if st.button("Compare documents", type="secondary"):
+        old_id = old_choice.split(" - ", maxsplit=1)[0]
+        new_id = new_choice.split(" - ", maxsplit=1)[0]
+        try:
+            diffs = diff_documents(backend, old_id, new_id)
+            st.success(f"Computed diffs for {len(diffs)} page(s)")
+            st.dataframe(
+                {
+                    "page": [d["page"] for d in diffs],
+                    "added geom": [len(d["geometry"]["added"]) for d in diffs],
+                    "removed geom": [len(d["geometry"]["removed"]) for d in diffs],
+                    "added text": [len(d["text"]["added"]) for d in diffs],
+                    "removed text": [len(d["text"]["removed"]) for d in diffs],
+                    "moved text": [len(d["text"]["moved"]) for d in diffs],
+                },
+                use_container_width=True,
             )
+            SessionManager.set_user_state("last_diffs", diffs)
+            SessionManager.set_user_state("last_pair", (old_id, new_id))
+        except Exception as exc:
+            st.error(f"Compare failed: {exc}")
 
-        if st.button("Compare documents", type="secondary"):
-            old_id = old_choice.split(" - ", maxsplit=1)[0]
-            new_id = new_choice.split(" - ", maxsplit=1)[0]
+    last_diffs = SessionManager.get_user_state("last_diffs")
+    last_pair = SessionManager.get_user_state("last_pair")
+
+    if last_diffs and last_pair:
+        old_id, new_id = last_pair
+        doc_map = {doc_id: (path, pages) for doc_id, path, pages in docs}
+        base_pdf_path = doc_map.get(new_id, (None,))[0]
+        overlay_name = f"diff_overlay_{old_id[:6]}_{new_id[:6]}.pdf"
+        overlay_path = outputs_dir / overlay_name
+
+        if st.button("Create overlay PDF", type="primary"):
             try:
-                diffs = diff_documents(backend, old_id, new_id)
-                st.success(f"Computed diffs for {len(diffs)} page(s)")
-                st.dataframe(
-                    {
-                        "page": [d["page"] for d in diffs],
-                        "added geom": [len(d["geometry"]["added"]) for d in diffs],
-                        "removed geom": [len(d["geometry"]["removed"]) for d in diffs],
-                        "added text": [len(d["text"]["added"]) for d in diffs],
-                        "removed text": [len(d["text"]["removed"]) for d in diffs],
-                        "moved text": [len(d["text"]["moved"]) for d in diffs],
-                    },
-                    use_container_width=True,
-                )
-                st.session_state["_last_diffs"] = diffs
-                st.session_state["_last_pair"] = (old_id, new_id)
+                if base_pdf_path is None:
+                    raise RuntimeError("Unable to resolve revised document path")
+                write_overlay(base_pdf_path, last_diffs, str(overlay_path))
+                st.success(f"Overlay written to {overlay_path}")
+                with open(overlay_path, "rb") as handle:
+                    st.download_button(
+                        "Download overlay PDF",
+                        data=handle,
+                        file_name=overlay_name,
+                        mime="application/pdf",
+                    )
             except Exception as exc:
-                st.error(f"Compare failed: {exc}")
-
-        if "_last_diffs" in st.session_state and "_last_pair" in st.session_state:
-            old_id, new_id = st.session_state["_last_pair"]
-            doc_map = {doc_id: (path, pages) for doc_id, path, pages in docs}
-            base_pdf_path = doc_map.get(new_id, (None,))[0]
-            overlay_name = f"diff_overlay_{old_id[:6]}_{new_id[:6]}.pdf"
-            overlay_path = outputs_dir / overlay_name
-
-            if st.button("Create overlay PDF", type="primary"):
-                try:
-                    if base_pdf_path is None:
-                        raise RuntimeError("Unable to resolve revised document path")
-                    write_overlay(base_pdf_path, st.session_state["_last_diffs"], str(overlay_path))
-                    st.success(f"Overlay written to {overlay_path}")
-                    with open(overlay_path, "rb") as handle:
-                        st.download_button(
-                            "Download overlay PDF",
-                            data=handle,
-                            file_name=overlay_name,
-                            mime="application/pdf",
-                        )
-                except Exception as exc:
-                    st.error(f"Overlay generation failed: {exc}")
-    else:
-        st.info("Ingest at least two documents to enable comparison.")
+                st.error(f"Overlay generation failed: {exc}")
+else:
+    st.info("Ingest at least two documents to enable comparison.")
 
 with viewer_tab:
     st.subheader("PDF Viewer")
@@ -919,7 +955,10 @@ with chat_tab:
         selected_id = selected_label.split(" - ", maxsplit=1)[0] if selected_label else None
 
         doc_map = {doc_id: (path, pages) for doc_id, path, pages in docs_for_chat}
-        chat_histories: Dict[str, List[Tuple[str, str]]] = st.session_state.setdefault("_rag_histories", {})
+        chat_histories = SessionManager.get_user_state("rag_histories")
+        if not isinstance(chat_histories, dict):
+            chat_histories = {}
+            SessionManager.set_user_state("rag_histories", chat_histories)
 
         if selected_id and selected_id in doc_map:
             doc_path_str, page_count = doc_map[selected_id]
@@ -931,6 +970,7 @@ with chat_tab:
                 st.caption(f"Document has {page_count} page(s). First response will build embeddings using Ollama.")
 
                 doc_history = chat_histories.setdefault(selected_id, [])
+                SessionManager.set_user_state("rag_histories", chat_histories)
                 col_init, col_reset = st.columns(2)
 
                 if col_init.button("Build / Refresh embeddings", key=f"rag_build_{selected_id}"):
@@ -944,6 +984,7 @@ with chat_tab:
 
                 if col_reset.button("Reset chat", key=f"rag_reset_{selected_id}"):
                     chat_histories[selected_id] = []
+                    SessionManager.set_user_state("rag_histories", chat_histories)
                     reset_rag_chat(selected_id)
                     st.rerun()
 
@@ -965,6 +1006,7 @@ with chat_tab:
                         answer = f"Error while contacting Ollama: {exc}"
                         reset_rag_chat(selected_id)
                     doc_history.append(("assistant", answer))
+                    SessionManager.set_user_state("rag_histories", chat_histories)
                     st.rerun()
         else:
             st.info("Select a document to begin chatting.")

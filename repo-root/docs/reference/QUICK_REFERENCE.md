@@ -230,7 +230,7 @@ repo-root/
 ```
 repo-root/pdf_compare/
 ├── pdf_extract_server.py   # Vector extraction
-├── raster_grid_improved.py # Raster comparison
+├── raster_grid.py # Raster comparison
 ├── rag_simple.py          # AI/RAG integration
 └── db_backend.py          # Database abstraction
 ```

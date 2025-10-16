@@ -40,7 +40,7 @@ debug_raster_comparison("old.pdf", "new.pdf", page_index=0)
 
 #### Use Improved Comparison
 ```python
-from pdf_compare.raster_grid_improved import raster_grid_changed_boxes
+from pdf_compare.raster_grid import raster_grid_changed_boxes
 
 boxes, metrics = raster_grid_changed_boxes(
     "old.pdf",
