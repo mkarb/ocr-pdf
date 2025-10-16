@@ -1,70 +1,125 @@
 """
-Database backend abstraction layer.
-Supports both SQLite and PostgreSQL via SQLAlchemy.
+PostgreSQL database backend using SQLAlchemy.
+Provides ORM-based storage for PDF vector data with full-text search support.
 """
 
 from __future__ import annotations
-from typing import List, Tuple, Optional, Dict, Any
-from pathlib import Path
+from typing import List, Tuple, Optional
 import json
+import os
+import random
+from contextlib import contextmanager
 
 from sqlalchemy import create_engine, text, select, delete
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.pool import StaticPool, NullPool
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool, StaticPool
 
 from .db_models import Base, Document, Page, GeometryRow, TextRow, Meta
 from .models import VectorMap, GeoKind
 
 
 class DatabaseBackend:
-    """Unified database backend supporting SQLite and PostgreSQL."""
+    """PostgreSQL database backend with SQLAlchemy ORM."""
 
-    def __init__(self, database_url: str):
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        read_replica_urls: Optional[List[str]] = None,
+        pool_size: int = 20,
+        max_overflow: int = 10,
+        pool_pre_ping: bool = True,
+    ):
         """
         Initialize database backend.
 
         Args:
             database_url: Database connection string
-                - SQLite: "sqlite:///path/to/file.db"
                 - PostgreSQL: "postgresql://user:pass@host:port/dbname"
+                - SQLite: "sqlite:///path/to/file.db" (for local dev/testing)
+            read_replica_urls: Optional list of PostgreSQL read replicas
+            pool_size: Connection pool size for primary engine
+            max_overflow: Overflow connections for pool
+            pool_pre_ping: Enable SQLAlchemy connection pre-ping
+
+        Raises:
+            ValueError: If database_url is not supported
         """
         self.database_url = database_url
-        self.is_sqlite = database_url.startswith("sqlite")
+        self.read_replica_urls = list(read_replica_urls or [])
         self.is_postgres = database_url.startswith("postgresql")
+        self.is_sqlite = database_url.startswith("sqlite")
 
-        # Configure engine based on database type
-        self.postgres_supports_websearch = False
+        if not (self.is_postgres or self.is_sqlite):
+            raise ValueError(
+                f"Unsupported database URL. Expected PostgreSQL or SQLite, got: {database_url[:32]}..."
+            )
 
+        # Primary engine (read/write)
         if self.is_sqlite:
-            # SQLite configuration
-            self.engine = create_engine(
+            self.write_engine = create_engine(
                 database_url,
                 connect_args={"check_same_thread": False},
                 poolclass=StaticPool,
-                echo=False
+                echo=False,
             )
-            # Enable WAL mode for better concurrency
-            with self.engine.connect() as conn:
-                conn.execute(text("PRAGMA journal_mode=WAL"))
-                conn.execute(text("PRAGMA foreign_keys=ON"))
-                conn.commit()
+            # Enable WAL for better concurrency
+            with self.write_engine.connect() as conn:
+                try:
+                    conn.execute(text("PRAGMA journal_mode=WAL"))
+                    conn.execute(text("PRAGMA foreign_keys=ON"))
+                    conn.commit()
+                except Exception:
+                    # Some SQLite builds may not support WAL commits
+                    pass
         else:
-            # PostgreSQL configuration
-            self.engine = create_engine(
+            self.write_engine = create_engine(
                 database_url,
-                poolclass=NullPool,
-                echo=False
+                poolclass=QueuePool,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_pre_ping=pool_pre_ping,
+                pool_recycle=3600,
+                echo=False,
             )
-            # Detect websearch_to_tsquery availability for richer search syntax
-            with self.engine.connect() as conn:
+
+        # Backwards compatibility attribute
+        self.engine = self.write_engine
+        self.postgres_supports_websearch = False
+
+        # Detect websearch_to_tsquery availability for richer search syntax
+        if self.is_postgres:
+            with self.write_engine.connect() as conn:
                 try:
                     conn.execute(text("SELECT websearch_to_tsquery('english', 'test')"))
                     self.postgres_supports_websearch = True
                 except Exception:
                     self.postgres_supports_websearch = False
 
-        # Create session factory
-        self.SessionLocal = sessionmaker(bind=self.engine)
+        # Configure read replicas (PostgreSQL only)
+        self.read_engines = []
+        if self.is_postgres:
+            for replica_url in self.read_replica_urls:
+                if not replica_url or replica_url == database_url:
+                    continue
+                engine = create_engine(
+                    replica_url,
+                    poolclass=QueuePool,
+                    pool_size=max(1, pool_size // 2),
+                    max_overflow=max(0, max_overflow // 2),
+                    pool_pre_ping=pool_pre_ping,
+                    pool_recycle=3600,
+                    echo=False,
+                )
+                self.read_engines.append(engine)
+        else:
+            self.read_engines = []
+
+        # Session factories
+        self.SessionLocal = sessionmaker(bind=self.write_engine)
+        self._read_sessionmakers = [sessionmaker(bind=engine) for engine in self.read_engines]
+        # Always include primary as fallback for reads
+        self._read_sessionmakers.append(self.SessionLocal)
 
         # Initialize schema
         self._init_schema()
@@ -73,51 +128,44 @@ class DatabaseBackend:
         """Create database schema if it doesn't exist."""
         Base.metadata.create_all(self.engine)
 
-        # Set FTS enabled flag for SQLite
+        # Set up PostgreSQL full-text search
         with self.SessionLocal() as session:
-            if self.is_sqlite:
-                # Check if FTS5 is available
-                try:
-                    session.execute(text("""
-                        CREATE VIRTUAL TABLE IF NOT EXISTS text_fts USING fts5(
-                            doc_id, page_number, text, bbox, font, size, content=''
-                        )
-                    """))
-                    session.execute(text("""
-                        CREATE TRIGGER IF NOT EXISTS text_fts_ai AFTER INSERT ON text_rows BEGIN
-                            INSERT INTO text_fts (doc_id, page_number, text, bbox, font, size)
-                            VALUES (new.doc_id, new.page_number, new.text, new.bbox, new.font, new.size);
-                        END
-                    """))
-                    session.execute(text("""
-                        CREATE TRIGGER IF NOT EXISTS text_fts_ad AFTER DELETE ON text_rows BEGIN
-                            INSERT INTO text_fts (text_fts, rowid, doc_id, page_number, text, bbox, font, size)
-                            VALUES ('delete', old.rowid, old.doc_id, old.page_number, old.text, old.bbox, old.font, old.size);
-                        END
-                    """))
-                    fts_enabled = "1"
-                except Exception:
-                    fts_enabled = "0"
-            else:
-                # PostgreSQL uses native full-text search
-                fts_enabled = "1"
-                # Create GIN index for full-text search
-                try:
-                    session.execute(text("""
-                        CREATE INDEX IF NOT EXISTS idx_text_fts
-                        ON text_rows USING gin(to_tsvector('english', text))
-                    """))
-                except Exception:
-                    pass
+            # Create GIN index for full-text search on text content
+            try:
+                session.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_text_fts
+                    ON text_rows USING gin(to_tsvector('english', text))
+                """))
+            except Exception:
+                # Index may already exist or insufficient permissions
+                pass
 
-            # Upsert meta flag
+            # Set FTS enabled flag
             meta = session.get(Meta, "fts_enabled")
             if meta:
-                meta.value = fts_enabled
+                meta.value = "1"
             else:
-                session.add(Meta(key="fts_enabled", value=fts_enabled))
+                session.add(Meta(key="fts_enabled", value="1"))
 
             session.commit()
+
+    def _get_read_sessionmaker(self):
+        """Select a read session factory (load-balanced across replicas)."""
+        if not self._read_sessionmakers:
+            return self.SessionLocal
+        if len(self._read_sessionmakers) == 1:
+            return self._read_sessionmakers[0]
+        return random.choice(self._read_sessionmakers)
+
+    @contextmanager
+    def read_session(self):
+        """Context manager that yields a session bound to a read engine."""
+        sessionmaker_cls = self._get_read_sessionmaker()
+        session = sessionmaker_cls()
+        try:
+            yield session
+        finally:
+            session.close()
 
     def upsert_vectormap(self, vm: VectorMap) -> None:
         """Store a VectorMap into the database."""
@@ -186,7 +234,7 @@ class DatabaseBackend:
 
     def list_documents(self) -> List[Tuple[str, str, int]]:
         """List all documents in the database."""
-        with self.SessionLocal() as session:
+        with self.read_session() as session:
             docs = session.query(Document).order_by(Document.doc_id.desc()).all()
             return [(d.doc_id, d.path, d.page_count) for d in docs]
 
@@ -233,7 +281,7 @@ class DatabaseBackend:
         Returns:
             List of (page_number, text, (x0,y0,x1,y1), source) tuples
         """
-        with self.SessionLocal() as session:
+        with self.read_session() as session:
             texts = session.query(
                 TextRow.page_number,
                 TextRow.text,
@@ -265,7 +313,7 @@ class DatabaseBackend:
         Returns:
             Formatted text content
         """
-        with self.SessionLocal() as session:
+        with self.read_session() as session:
             # Get document info
             doc = session.get(Document, doc_id)
             if not doc:
@@ -330,56 +378,39 @@ class DatabaseBackend:
         limit: int = 100
     ) -> List[Tuple]:
         """
-        Full-text search across text content.
+        Full-text search across text content using PostgreSQL full-text search.
 
-        Returns: List of (doc_id, page_number, text, bbox, font, size)
+        Args:
+            query: Search query string (supports web search syntax if available)
+            doc_id: Optional document ID to filter results
+            page: Optional page number to filter results
+            limit: Maximum number of results to return
+
+        Returns:
+            List of (doc_id, page_number, text, bbox, font, size) tuples
         """
-        with self.SessionLocal() as session:
-            # Check if FTS is enabled
-            meta = session.get(Meta, "fts_enabled")
-            fts_enabled = meta and meta.value == "1"
-
-            if self.is_sqlite and fts_enabled:
-                # Use FTS5 for SQLite
-                sql = text("""
-                    SELECT doc_id, page_number, text, bbox, font, size
-                    FROM text_fts
-                    WHERE text_fts MATCH :query
-                """)
-                params = {"query": query}
-
-                if doc_id:
-                    sql = text(str(sql) + " AND doc_id = :doc_id")
-                    params["doc_id"] = doc_id
-                if page:
-                    sql = text(str(sql) + " AND page_number = :page")
-                    params["page"] = page
-
-                sql = text(str(sql) + f" LIMIT {limit}")
-                result = session.execute(sql, params)
-
-            elif self.is_postgres:
-                # Use PostgreSQL full-text search
+        with self.read_session() as session:
+            if self.is_postgres:
                 tsquery_fn = "websearch_to_tsquery" if self.postgres_supports_websearch else "plainto_tsquery"
-                sql = text(f"""
-                    SELECT doc_id, page_number, text, bbox, font, size
-                    FROM text_rows
-                    WHERE to_tsvector('english', text) @@ {tsquery_fn}('english', :query)
-                """)
-                params = {"query": query}
+                clauses = [
+                    "SELECT doc_id, page_number, text, bbox, font, size",
+                    "FROM text_rows",
+                    f"WHERE to_tsvector('english', text) @@ {tsquery_fn}('english', :query)"
+                ]
+                params = {"query": query, "limit": limit}
 
                 if doc_id:
-                    sql = text(str(sql) + " AND doc_id = :doc_id")
+                    clauses.append("AND doc_id = :doc_id")
                     params["doc_id"] = doc_id
                 if page:
-                    sql = text(str(sql) + " AND page_number = :page")
+                    clauses.append("AND page_number = :page")
                     params["page"] = page
 
-                sql = text(str(sql) + f" LIMIT {limit}")
+                clauses.append("ORDER BY page_number LIMIT :limit")
+                sql = text(" ".join(clauses))
                 result = session.execute(sql, params)
-
             else:
-                # Fallback to LIKE search
+                # Fallback simple LIKE search (SQLite or unsupported engines)
                 query_like = query.replace("*", "%")
                 stmt = select(
                     TextRow.doc_id,
@@ -395,14 +426,14 @@ class DatabaseBackend:
                 if page:
                     stmt = stmt.where(TextRow.page_number == page)
 
-                stmt = stmt.limit(limit)
+                stmt = stmt.order_by(TextRow.page_number).limit(limit)
                 result = session.execute(stmt)
 
             return result.fetchall()
 
     def load_page_geoms(self, doc_id: str, page: int) -> List[bytes]:
         """Load geometry WKB data for a page."""
-        with self.SessionLocal() as session:
+        with self.read_session() as session:
             geoms = session.query(GeometryRow.wkb).filter(
                 GeometryRow.doc_id == doc_id,
                 GeometryRow.page_number == page
@@ -411,7 +442,7 @@ class DatabaseBackend:
 
     def load_page_texts(self, doc_id: str, page: int) -> List[Tuple[str, Tuple[float, float, float, float]]]:
         """Load text data for a page."""
-        with self.SessionLocal() as session:
+        with self.read_session() as session:
             texts = session.query(TextRow.text, TextRow.bbox).filter(
                 TextRow.doc_id == doc_id,
                 TextRow.page_number == page
@@ -430,16 +461,57 @@ class DatabaseBackend:
 
     def close(self):
         """Close database connections."""
-        self.engine.dispose()
+        if hasattr(self, "write_engine"):
+            self.write_engine.dispose()
+        for engine in getattr(self, "read_engines", []):
+            engine.dispose()
 
 
-def create_backend(database_url: str = "sqlite:///vectormap.sqlite") -> DatabaseBackend:
+def create_backend(
+    database_url: str,
+    *,
+    read_replica_urls: Optional[List[str]] = None,
+    pool_size: int = 20,
+    max_overflow: int = 10,
+    pool_pre_ping: bool = True,
+) -> DatabaseBackend:
     """
-    Factory function to create a database backend.
+    Factory function to create a PostgreSQL database backend.
 
     Args:
-        database_url: Database connection string
-            - SQLite: "sqlite:///path/to/file.db" (default)
-            - PostgreSQL: "postgresql://user:pass@host:port/dbname"
+        database_url: PostgreSQL connection string
+            Format: "postgresql://user:pass@host:port/dbname"
+        read_replica_urls: Optional list of read replica URLs
+        pool_size: Connection pool size for primary engine
+        max_overflow: Overflow connection count
+        pool_pre_ping: Enable SQLAlchemy connection pre-ping
+
+    Returns:
+        DatabaseBackend instance
+
+    Raises:
+        ValueError: If database_url is not a PostgreSQL URL
     """
-    return DatabaseBackend(database_url)
+    if read_replica_urls is None:
+        read_replica_urls = []
+        # Support both DATABASE_READ_URL and DATABASE_READ_URL_n env vars
+        single_replica = os.getenv("DATABASE_READ_URL")
+        if single_replica:
+            read_replica_urls.append(single_replica)
+
+        idx = 1
+        while True:
+            env_key = f"DATABASE_READ_URL_{idx}"
+            replica_url = os.getenv(env_key)
+            if not replica_url:
+                break
+            read_replica_urls.append(replica_url)
+            idx += 1
+
+    return DatabaseBackend(
+        database_url,
+        read_replica_urls=read_replica_urls,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_pre_ping=pool_pre_ping,
+    )

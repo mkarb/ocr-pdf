@@ -100,7 +100,7 @@ Users → Nginx (Load Balancer) → Streamlit Instances (3-10+)
 | `nginx.conf` | Load balancer with sticky sessions |
 | `init-replication.sh` | PostgreSQL replication setup |
 | `.env.scaled` | Environment configuration template |
-| `pdf_compare/db_backend_scaled.py` | Database backend with read/write splitting |
+| `pdf_compare/db_backend.py` | Unified database backend with replica support |
 | `ui/streamlit_session_manager.py` | Session isolation utilities |
 | `prometheus.yml` | Monitoring configuration |
 | `docs/deployment/SCALED_DEPLOYMENT.md` | Complete deployment guide |
@@ -196,10 +196,11 @@ docker-compose -f docker-compose-scaled.yml up -d --scale pdf-compare-ui=2
 To use read/write splitting in your code:
 
 ```python
-from pdf_compare.db_backend_scaled import create_scaled_backend
+import os
+from pdf_compare.db_backend import create_backend
 
 # Automatically uses DATABASE_URL and DATABASE_READ_URL_* from environment
-backend = create_scaled_backend()
+backend = create_backend(os.getenv("DATABASE_URL"))
 
 # Read operations automatically use replicas
 docs = backend.list_documents()  # Uses read replica
@@ -222,7 +223,7 @@ backend.upsert_vectormap(vectormap)  # Uses primary
 For detailed information, see:
 - [Full Deployment Guide](docs/deployment/SCALED_DEPLOYMENT.md)
 - [Session Management](ui/streamlit_session_manager.py)
-- [Database Scaling](pdf_compare/db_backend_scaled.py)
+- [Database Scaling](pdf_compare/db_backend.py)
 
 ## Comparison: Single vs Scaled
 

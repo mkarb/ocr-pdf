@@ -92,7 +92,7 @@ notepad .env
 - `nginx.conf` - Load balancer config
 - `init-replication.sh` - PostgreSQL replication setup
 - `.env.scaled` - Configuration template
-- `pdf_compare/db_backend_scaled.py` - Read/write splitting
+- `pdf_compare/db_backend.py` - Replica-aware backend
 - `ui/streamlit_session_manager.py` - Session isolation
 - `prometheus.yml` - Monitoring config
 - `docs/deployment/SCALED_DEPLOYMENT.md` - Full docs
@@ -275,7 +275,7 @@ If you're currently using `.\build.ps1 full up`:
 - **Quick Start**: [SCALING_QUICKSTART.md](SCALING_QUICKSTART.md)
 - **Full Guide**: [docs/deployment/SCALED_DEPLOYMENT.md](docs/deployment/SCALED_DEPLOYMENT.md)
 - **Session Management**: [ui/streamlit_session_manager.py](ui/streamlit_session_manager.py)
-- **Database Scaling**: [pdf_compare/db_backend_scaled.py](pdf_compare/db_backend_scaled.py)
+- **Database Scaling**: [pdf_compare/db_backend.py](pdf_compare/db_backend.py)
 
 ## Support
 

@@ -12,7 +12,7 @@
 - Debug tool to visualize why differences are detected
 
 **Files**:
-- `pdf_compare/raster_grid_improved.py` - Fixed implementation
+- `pdf_compare/raster_grid.py` - Fixed implementation
 - `pdf_compare/raster_diff_debug.py` - Debug visualization tool
 - `RASTER_COMPARISON_GUIDE.md` - Complete usage guide
 
@@ -71,7 +71,7 @@ print(chat.ask("What symbols are in the legend?"))
 ### Quick Start: Fix Raster Comparison
 
 ```python
-from pdf_compare.raster_grid_improved import raster_grid_changed_boxes
+from pdf_compare.raster_grid import raster_grid_changed_boxes
 
 # Use improved version with white space skipping
 boxes, metrics = raster_grid_changed_boxes(
@@ -336,7 +336,7 @@ with open("comparison_report.txt", "w") as f:
 
 ```
 pdf_compare/
-├── raster_grid_improved.py      # Fixed raster comparison
+├── raster_grid.py      # Fixed raster comparison
 ├── raster_diff_debug.py          # Debug tool
 ├── rag_simple.py                 # Simple RAG implementation
 ├── rag_symbol_recognition.py    # Advanced RAG (optional)
@@ -378,7 +378,7 @@ Scripts:
 
 4. **Integrate into your workflow**
    - Use `rag_simple.py` for symbol recognition
-   - Use `raster_grid_improved.py` for pixel-level comparison
+   - Use `raster_grid.py` for pixel-level comparison
    - Combine both for intelligent + precise comparison
 
 ## Troubleshooting
