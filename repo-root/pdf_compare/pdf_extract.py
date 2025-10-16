@@ -5,8 +5,16 @@ from dataclasses import asdict
 import hashlib
 import os
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
+
+from .worker_pool import (
+    configure_thread_env,
+    ThrottledPoolExecutor,
+    worker_init,
+    get_cached_doc,
+    get_optimal_workers,
+)
+
+configure_thread_env()
 
 import numpy as np
 import fitz  # PyMuPDF
@@ -29,8 +37,8 @@ DEF_MIN_FILL_AREA   = 0.50     # drop tiny filled rects (< 0.5 sq units)
 DEF_BEZIER_SAMPLES  = 24       # samples per cubic segment (higher = smoother)
 DEF_SIMPLIFY_TOL    = None     # e.g., 0.05..0.15 to reduce oversampled paths
 
-# Use all cores minus one by default
-DEFAULT_WORKERS = max(1, (os.cpu_count() or 4) - 2)
+# Worker configuration (managed by worker_pool module)
+# See worker_pool.get_optimal_workers() for dynamic worker allocation
 
 
 # -----------------------
@@ -196,17 +204,7 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
     return runs
 
 
-# -----------------------
-# Per-process page worker with cached document
-# -----------------------
-# Process-level cache: keeps one document handle per process to avoid repeated opens
-_PROCESS_DOC_CACHE: Dict[str, "fitz.Document"] = {}
-
-def _get_cached_doc(pdf_path: str) -> "fitz.Document":
-    """Get or create a cached document handle for this process."""
-    if pdf_path not in _PROCESS_DOC_CACHE:
-        _PROCESS_DOC_CACHE[pdf_path] = fitz.open(pdf_path)
-    return _PROCESS_DOC_CACHE[pdf_path]
+# Note: Worker initialization and document caching are now handled by worker_pool module
 
 def _extract_page_job(
     pdf_path: str,
@@ -222,7 +220,7 @@ def _extract_page_job(
     Uses process-level cached document to avoid repeated file opens.
     Avoids passing PyMuPDF/Shapely objects across processes.
     """
-    doc = _get_cached_doc(pdf_path)
+    doc = get_cached_doc(pdf_path)
     pg = doc[page_index]
     rotation = pg.rotation if pg.rotation in DEFAULT_ROTATIONS else 0
 
@@ -282,33 +280,26 @@ def pdf_to_vectormap(
     if doc_id is None:
         doc_id = _hash_file(p)
 
-    # Resolve worker count
-    if workers <= 0:
-        workers = DEFAULT_WORKERS
-
-    # Smart worker allocation based on document size
-    # - Single page: always use 1 worker (no benefit from parallel)
-    # - 2-4 pages: use 2 workers
-    # - 5+ pages: use DEFAULT_WORKERS
-    if page_count == 1:
-        workers = 1
-    elif page_count <= 4:
-        workers = min(2, workers)
-    else:
-        workers = max(1, min(workers, page_count))
-
-    # Detect Streamlit environment - only force serial for small docs
-    # Multi-page docs benefit from parallel processing even in Streamlit
-    in_streamlit = False
+    # Detect Streamlit environment - force serial for small docs or OCR
+    force_serial = False
     try:
         import streamlit
         from streamlit.runtime.scriptrunner import get_script_run_ctx
         if get_script_run_ctx() is not None:
-            in_streamlit = True
-            if page_count <= 2:
-                workers = 1  # Force serial only for 1-2 page docs
+            # Streamlit + OCR + multiprocessing = context issues → force serial
+            # Also force serial for very small docs (1-2 pages)
+            if enable_ocr or page_count <= 2:
+                force_serial = True
     except (ImportError, AttributeError):
         pass  # Not running under Streamlit
+
+    # Determine optimal worker count
+    workers = get_optimal_workers(
+        requested_workers=workers,
+        page_count=page_count,
+        enable_ocr=enable_ocr,
+        force_serial=force_serial,
+    )
 
     # Log worker allocation
     import sys
@@ -335,22 +326,26 @@ def pdf_to_vectormap(
                 )
             )
     else:
-        with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as ex:
-            futs = [
-                ex.submit(
-                    _extract_page_job,
+        # Use ThrottledPoolExecutor for memory-bounded parallel processing
+        with ThrottledPoolExecutor(max_workers=workers, initializer=worker_init) as pool:
+            # Helper to convert page_index to worker arguments
+            def item_to_args(page_idx: int) -> tuple:
+                return (
                     str(p),
-                    i,
+                    page_idx,
                     min_segment_len,
                     min_fill_area,
                     bezier_samples,
                     simplify_tolerance,
                     enable_ocr,
                 )
-                for i in range(page_count)
-            ]
-            for fut in as_completed(futs):
-                page_dicts.append(fut.result())
+
+            page_dicts = pool.submit_throttled(
+                worker_func=_extract_page_job,
+                items=range(page_count),
+                progress_callback=None,  # No callback for client mode
+                item_to_args=item_to_args,
+            )
 
     # Convert dicts → dataclasses and sort by page_number
     pages: List[PageVectors] = []

@@ -125,6 +125,12 @@ def get_document_text_with_coords(backend: DatabaseBackend, doc_id: str):
     return backend.get_document_text_with_coords(doc_id)
 
 
+def get_vectormap(backend: DatabaseBackend, doc_id: str, page_numbers: list[int] | None = None) -> VectorMap | None:
+    """Retrieve a stored VectorMap for the given document."""
+
+    return backend.get_vectormap(doc_id, page_numbers=page_numbers)
+
+
 # Export public API
 __all__ = [
     "open_db",
@@ -134,5 +140,6 @@ __all__ = [
     "delete_all_documents",
     "export_document_text",
     "get_document_text_with_coords",
+    "get_vectormap",
     "DatabaseBackend",
 ]

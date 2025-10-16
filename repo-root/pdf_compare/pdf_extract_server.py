@@ -27,8 +27,16 @@ import os
 import logging
 import time
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
+
+from .worker_pool import (
+    configure_thread_env,
+    ThrottledPoolExecutor,
+    worker_init,
+    get_cached_doc,
+    get_optimal_workers,
+)
+
+configure_thread_env()
 
 import numpy as np
 import fitz  # PyMuPDF
@@ -55,9 +63,8 @@ DEF_MIN_FILL_AREA = float(os.getenv("PDF_MIN_FILL_AREA", "0.50"))
 DEF_BEZIER_SAMPLES = int(os.getenv("PDF_BEZIER_SAMPLES", "24"))
 DEF_SIMPLIFY_TOL = float(os.getenv("PDF_SIMPLIFY_TOL", "0")) if os.getenv("PDF_SIMPLIFY_TOL") else None
 
-# Worker configuration
-CPU_LIMIT = int(os.getenv("CPU_LIMIT", os.cpu_count() or 4))
-DEFAULT_WORKERS = max(1, CPU_LIMIT - 1)  # Leave one core for orchestration
+# Worker configuration (managed by worker_pool module)
+# See worker_pool.get_optimal_workers() for dynamic worker allocation
 
 
 # -----------------------
@@ -166,18 +173,7 @@ def _extract_text(page: "fitz.Page") -> List[Dict[str, Any]]:
     return runs
 
 
-# -----------------------
-# Per-process page worker with cached document
-# -----------------------
-# Process-level cache: keeps one document handle per process to avoid repeated opens
-_PROCESS_DOC_CACHE: Dict[str, "fitz.Document"] = {}
-
-
-def _get_cached_doc(pdf_path: str) -> "fitz.Document":
-    """Get or create a cached document handle for this process."""
-    if pdf_path not in _PROCESS_DOC_CACHE:
-        _PROCESS_DOC_CACHE[pdf_path] = fitz.open(pdf_path)
-    return _PROCESS_DOC_CACHE[pdf_path]
+# Note: Worker initialization and document caching are now handled by worker_pool module
 
 
 def _extract_page_job_server(
@@ -196,7 +192,7 @@ def _extract_page_job_server(
     start_time = time.perf_counter()
 
     try:
-        doc = _get_cached_doc(pdf_path)
+        doc = get_cached_doc(pdf_path)
         pg = doc[page_index]
         rotation = pg.rotation if pg.rotation in DEFAULT_ROTATIONS else 0
 
@@ -283,15 +279,16 @@ def pdf_to_vectormap_server(
 
     logger.info(f"Starting extraction: doc_id={doc_id}, pages={page_count}, path={path}")
 
-    # Resolve worker count from environment or parameter
-    if workers <= 0:
-        workers = DEFAULT_WORKERS
-    workers = max(1, min(workers, page_count))
+    # Determine optimal worker count
+    workers = get_optimal_workers(
+        requested_workers=workers,
+        page_count=page_count,
+        enable_ocr=False,  # Server mode doesn't use OCR
+        force_serial=False,
+    )
 
     logger.info(f"Using {workers} worker(s) for {page_count} page(s)")
 
-    # Map pages in parallel (fork for Linux/Mac, spawn for Windows)
-    mp_context = mp.get_context("fork" if os.name != "nt" else "spawn")
     page_dicts: List[Dict[str, Any]] = []
 
     if workers == 1:
@@ -310,25 +307,25 @@ def pdf_to_vectormap_server(
             if progress_callback:
                 progress_callback(i + 1, page_count)
     else:
-        with ProcessPoolExecutor(max_workers=workers, mp_context=mp_context) as ex:
-            futs = [
-                ex.submit(
-                    _extract_page_job_server,
+        # Use ThrottledPoolExecutor for memory-bounded parallel processing
+        with ThrottledPoolExecutor(max_workers=workers, initializer=worker_init) as pool:
+            # Helper to convert page_index to worker arguments
+            def item_to_args(page_idx: int) -> tuple:
+                return (
                     str(p),
-                    i,
+                    page_idx,
                     min_segment_len,
                     min_fill_area,
                     bezier_samples,
                     simplify_tolerance,
                 )
-                for i in range(page_count)
-            ]
-            completed = 0
-            for fut in as_completed(futs):
-                page_dicts.append(fut.result())
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed, page_count)
+
+            page_dicts = pool.submit_throttled(
+                worker_func=_extract_page_job_server,
+                items=range(page_count),
+                progress_callback=progress_callback,
+                item_to_args=item_to_args,
+            )
 
     # Convert dicts → dataclasses and sort by page_number
     pages: List[PageVectors] = []

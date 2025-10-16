@@ -15,7 +15,7 @@ Uses hybrid detection approach:
 """
 
 from __future__ import annotations
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -26,6 +26,10 @@ import numpy as np
 import fitz  # PyMuPDF
 import pytesseract
 from rapidfuzz import fuzz
+from collections import defaultdict
+
+from shapely import wkb as shapely_wkb
+from shapely.geometry import LineString, MultiLineString
 
 
 # ========================
@@ -88,32 +92,57 @@ class Table:
         }
 
     def to_dataframe(self):
-        """Convert table to pandas DataFrame."""
+        """
+        Convert table to pandas DataFrame, preserving empty cells and table structure.
+
+        Empty cells detected in the original table are preserved as empty strings.
+        """
         try:
             import pandas as pd
         except ImportError:
             raise ImportError("pandas is required for to_dataframe(). Install with: pip install pandas")
 
-        # Build data dict with proper padding for missing cells
-        data = {}
-        num_cols = len(self.headers)
+        # Handle edge case: no headers
+        if not self.headers:
+            # Generate default headers based on max columns found
+            max_cols = max((max(cell.col for cell in row.cells) if row.cells else 0) for row in self.rows) if self.rows else 0
+            self.headers = [f"Column_{i}" for i in range(max_cols + 1)]
 
-        for i, header in enumerate(self.headers):
-            data[header] = []
+        # Handle duplicate headers by making them unique
+        seen_headers = {}
+        unique_headers = []
+        for header in self.headers:
+            if header in seen_headers:
+                seen_headers[header] += 1
+                unique_headers.append(f"{header}_{seen_headers[header]}")
+            else:
+                seen_headers[header] = 0
+                unique_headers.append(header)
+
+        num_cols = len(unique_headers)
+
+        # Build rows as lists (more reliable than dict for pandas)
+        rows_data = []
 
         for row in self.rows:
             # Create a dict to map column index to cell text
             row_data = {}
             for cell in row.cells:
+                # Map cell column index to text (preserving empty strings)
                 if cell.col < num_cols:
                     row_data[cell.col] = cell.text
 
-            # Add cells in order, padding missing columns with empty strings
-            for i in range(num_cols):
-                cell_text = row_data.get(i, "")
-                data[self.headers[i]].append(cell_text)
+            # Build complete row, filling missing columns with empty strings
+            # This preserves the table structure with empty cells
+            row_list = []
+            for col_idx in range(num_cols):
+                cell_text = row_data.get(col_idx, "")  # Empty string if cell not found
+                row_list.append(cell_text)
 
-        return pd.DataFrame(data)
+            rows_data.append(row_list)
+
+        # Create DataFrame from rows
+        return pd.DataFrame(rows_data, columns=unique_headers)
 
 
 @dataclass
@@ -153,6 +182,26 @@ class TableExtractionConfig:
     # Validation
     min_rows: int = 2  # Minimum rows to consider valid table
     min_cols: int = 2  # Minimum columns to consider valid table
+
+    # Grid reconstruction (vector geometry driven)
+    enable_bom_grid_reconstruction: bool = True
+    bom_expected_headers: List[str] = field(default_factory=lambda: [
+        "CAGE CODE",
+        "MATERIAL",
+        "PART NAME OR DESCRIPTION",
+        "PART NUMBER",
+        "ZONE",
+        "QTY REQD",
+        "FIND NO."
+    ])
+    bom_line_orientation_tol: float = 1.5  # Max deviation from perfect axis alignment
+    bom_min_horizontal_span_ratio: float = 0.15  # Fraction of page width for horizontal grid lines
+    bom_min_vertical_span_ratio: float = 0.25  # Fraction of page height for vertical grid lines
+    bom_block_overlap_tolerance: float = 15.0  # How close parallel segments must be to belong to same block
+    bom_row_merge_tolerance: float = 1.2  # Merge nearly coincident row lines (PDF units)
+    bom_row_band_padding: float = 1.5  # Padding when assigning text to row bands (PDF units)
+    bom_gap_multiplier: float = 2.2  # Gap multiplier to detect block breaks
+    bom_min_rows: int = 4  # Minimum horizontal lines in a block to treat as table
 
 
 # ========================
@@ -409,6 +458,93 @@ def extract_cell_text(
 
 
 # ========================
+# Vector geometry helpers (grid reconstruction)
+# ========================
+
+def _iter_line_strings(geometry) -> Iterable[LineString]:
+    """Yield LineString objects from a shapely geometry of arbitrary nesting."""
+    if isinstance(geometry, LineString):
+        yield geometry
+    elif isinstance(geometry, MultiLineString):
+        for geom in geometry.geoms:
+            yield from _iter_line_strings(geom)
+    elif hasattr(geometry, "geoms"):
+        for geom in geometry.geoms:
+            yield from _iter_line_strings(geom)
+
+
+def _ranges_overlap(a0: float, a1: float, b0: float, b1: float, pad: float) -> bool:
+    """Return True when two 1D ranges overlap within a tolerance."""
+    return min(a1, b1) + pad >= max(a0, b0) - pad
+
+
+def _dedup_sorted(values: Iterable[float], tol: float) -> List[float]:
+    """Merge nearly identical sorted positions into a single representative."""
+    dedup: List[float] = []
+    for value in sorted(values):
+        if not dedup:
+            dedup.append(value)
+            continue
+        if abs(value - dedup[-1]) <= tol:
+            dedup[-1] = (dedup[-1] + value) / 2.0
+        else:
+            dedup.append(value)
+    return dedup
+
+
+def _boundaries_from_centers(
+    centers: List[float],
+    left: float,
+    right: float,
+    count: int
+) -> List[float]:
+    """Infer column boundaries from column center positions."""
+    if count <= 0:
+        return [left, right]
+
+    centers_sorted = sorted(centers)
+    if not centers_sorted:
+        step = (right - left) / float(count)
+        return [left + step * i for i in range(count + 1)]
+
+    # Fall back to uniform spacing when we have fewer centers than needed
+    if len(centers_sorted) < count:
+        step = (right - left) / float(count)
+        return [left + step * i for i in range(count + 1)]
+
+    span = centers_sorted[-1] - centers_sorted[0]
+    if span <= 0.01:
+        step = (right - left) / float(count)
+        return [left + step * i for i in range(count + 1)]
+
+    initial = [centers_sorted[0] + span * (i + 0.5) / count for i in range(count)]
+    cluster_centers = initial
+
+    for _ in range(10):
+        clusters: List[List[float]] = [[] for _ in range(count)]
+        for value in centers_sorted:
+            idx = min(range(count), key=lambda i: abs(value - cluster_centers[i]))
+            clusters[idx].append(value)
+        new_centers = []
+        for idx, cluster in enumerate(clusters):
+            if cluster:
+                new_centers.append(sum(cluster) / len(cluster))
+            else:
+                new_centers.append(cluster_centers[idx])
+        if max(abs(a - b) for a, b in zip(cluster_centers, new_centers)) < 0.25:
+            cluster_centers = new_centers
+            break
+        cluster_centers = new_centers
+
+    cluster_centers.sort()
+    boundaries = [left]
+    for i in range(len(cluster_centers) - 1):
+        boundaries.append((cluster_centers[i] + cluster_centers[i + 1]) / 2.0)
+    boundaries.append(right)
+    return boundaries
+
+
+# ========================
 # Table Classification
 # ========================
 
@@ -460,6 +596,342 @@ class TableExtractor:
         self.config = config or TableExtractionConfig()
         self.tables: List[Table] = []
 
+    def _extract_bom_from_vectors(
+        self,
+        page_vectors,
+        page_index: int,
+        table_bbox: Optional[Tuple[float, float, float, float]]
+    ) -> Optional[Table]:
+        """Reconstruct a BOM table using vector geometry and text positions."""
+
+        config = self.config
+
+        if not config.enable_bom_grid_reconstruction or not page_vectors:
+            return None
+
+        orientation_tol = config.bom_line_orientation_tol
+        min_h_span = page_vectors.width * config.bom_min_horizontal_span_ratio
+        min_v_span = page_vectors.height * config.bom_min_vertical_span_ratio
+
+        horizontal_segments: List[Dict[str, float]] = []
+        vertical_segments: List[Dict[str, float]] = []
+
+        bbox = table_bbox
+
+        for geom in getattr(page_vectors, "geoms", []):
+            try:
+                if getattr(geom.kind, "name", "") != "STROKE":
+                    continue
+            except AttributeError:
+                continue
+
+            try:
+                shape = shapely_wkb.loads(geom.wkb)
+            except Exception:
+                continue
+
+            if shape.is_empty:
+                continue
+
+            for line in _iter_line_strings(shape):
+                minx, miny, maxx, maxy = line.bounds
+
+                if bbox:
+                    if maxx < bbox[0] - orientation_tol or minx > bbox[2] + orientation_tol:
+                        continue
+                    if maxy < bbox[1] - orientation_tol or miny > bbox[3] + orientation_tol:
+                        continue
+
+                dx = abs(maxx - minx)
+                dy = abs(maxy - miny)
+                length = line.length
+
+                if length < min(min_h_span, min_v_span):
+                    continue
+
+                if dy <= orientation_tol and dx >= min_h_span:
+                    horizontal_segments.append({
+                        "x0": minx,
+                        "x1": maxx,
+                        "y": (miny + maxy) / 2.0,
+                        "length": length,
+                    })
+                elif dx <= orientation_tol and dy >= min_v_span:
+                    vertical_segments.append({
+                        "x": (minx + maxx) / 2.0,
+                        "y0": min(miny, maxy),
+                        "y1": max(miny, maxy),
+                        "length": length,
+                    })
+
+        if len(horizontal_segments) < config.bom_min_rows:
+            return None
+
+        horizontal_segments.sort(key=lambda seg: (seg["y"], seg["x0"]))
+        blocks: List[Dict[str, Any]] = []
+
+        for seg in horizontal_segments:
+            assigned = None
+            for block in blocks:
+                if _ranges_overlap(seg["x0"], seg["x1"], block["x0"], block["x1"], config.bom_block_overlap_tolerance):
+                    block["segments"].append(seg)
+                    block["x0"] = min(block["x0"], seg["x0"])
+                    block["x1"] = max(block["x1"], seg["x1"])
+                    block["ys"].append(seg["y"])
+                    assigned = block
+                    break
+            if assigned is None:
+                blocks.append({
+                    "segments": [seg],
+                    "x0": seg["x0"],
+                    "x1": seg["x1"],
+                    "ys": [seg["y"]],
+                })
+
+        valid_blocks: List[Dict[str, Any]] = []
+        for block in blocks:
+            row_levels = _dedup_sorted(block["ys"], config.bom_row_merge_tolerance)
+            if len(row_levels) < config.bom_min_rows:
+                continue
+            block["row_levels"] = sorted(row_levels)
+            block["y0"] = block["row_levels"][0]
+            block["y1"] = block["row_levels"][-1]
+            valid_blocks.append(block)
+
+        if not valid_blocks:
+            return None
+
+        text_entries = []
+        for text_run in getattr(page_vectors, "texts", []):
+            text_value = (getattr(text_run, "text", "") or "").strip()
+            if not text_value:
+                continue
+            x0, y0, x1, y1 = text_run.bbox
+            text_entries.append({
+                "text": text_value,
+                "bbox": (x0, y0, x1, y1),
+                "cx": (x0 + x1) / 2.0,
+                "cy": (y0 + y1) / 2.0,
+            })
+
+        if not text_entries:
+            return None
+
+        expected_cols = len(config.bom_expected_headers)
+        valid_blocks.sort(key=lambda b: b["x0"])
+
+        block_results: List[Dict[str, Any]] = []
+
+        for block_index, block in enumerate(valid_blocks):
+            row_levels = block.get("row_levels", [])
+            if len(row_levels) < 2:
+                continue
+
+            row_bands = [
+                (row_levels[i], row_levels[i + 1])
+                for i in range(len(row_levels) - 1)
+            ]
+
+            block_texts = [
+                entry for entry in text_entries
+                if block["x0"] - config.bom_block_overlap_tolerance <= entry["cx"] <= block["x1"] + config.bom_block_overlap_tolerance
+                and block["y0"] - config.bom_block_overlap_tolerance <= entry["cy"] <= block["y1"] + config.bom_block_overlap_tolerance
+            ]
+
+            if not block_texts:
+                continue
+
+            candidate_verticals = []
+            for seg in vertical_segments:
+                if seg["x"] < block["x0"] - config.bom_block_overlap_tolerance or seg["x"] > block["x1"] + config.bom_block_overlap_tolerance:
+                    continue
+                overlap = min(seg["y1"], block["y1"]) - max(seg["y0"], block["y0"])
+                if overlap <= 0:
+                    continue
+                if overlap >= (block["y1"] - block["y0"]) * 0.6:
+                    candidate_verticals.append(seg["x"])
+
+            boundaries = _dedup_sorted(candidate_verticals, 0.8)
+            if not boundaries or boundaries[0] > block["x0"] + 0.8:
+                boundaries.insert(0, block["x0"])
+            if boundaries[-1] < block["x1"] - 0.8:
+                boundaries.append(block["x1"])
+            boundaries = _dedup_sorted(boundaries, 0.8)
+
+            if len(boundaries) - 1 < expected_cols:
+                centers = [entry["cx"] for entry in block_texts]
+                boundaries = _boundaries_from_centers(centers, block["x0"], block["x1"], expected_cols)
+            elif len(boundaries) - 1 > expected_cols:
+                while len(boundaries) - 1 > expected_cols and len(boundaries) > 2:
+                    diffs = [
+                        (boundaries[i + 1] - boundaries[i], i)
+                        for i in range(len(boundaries) - 1)
+                    ]
+                    diffs.sort(key=lambda item: item[0])
+                    _, idx_min = diffs[0]
+                    merged = (boundaries[idx_min] + boundaries[idx_min + 1]) / 2.0
+                    boundaries[idx_min] = merged
+                    del boundaries[idx_min + 1]
+
+            column_centers = [
+                (boundaries[i] + boundaries[i + 1]) / 2.0
+                for i in range(len(boundaries) - 1)
+            ]
+
+            if len(column_centers) != expected_cols:
+                continue
+
+            rows_draft: List[Dict[str, Any]] = []
+
+            for top, bottom in row_bands:
+                if abs(bottom - top) < 0.5:
+                    continue
+
+                row_texts = [
+                    entry for entry in block_texts
+                    if top - config.bom_row_band_padding <= entry["cy"] <= bottom + config.bom_row_band_padding
+                ]
+
+                if not row_texts:
+                    continue
+
+                buckets: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+                for entry in row_texts:
+                    col_idx = min(
+                        range(len(column_centers)),
+                        key=lambda i: abs(entry["cx"] - column_centers[i])
+                    )
+                    buckets[col_idx].append(entry)
+
+                cells = []
+                row_text_upper_parts: List[str] = []
+
+                for col_idx in range(expected_cols):
+                    entries = buckets.get(col_idx, [])
+                    if entries:
+                        entries.sort(key=lambda e: e["cx"])
+                        text_value = " ".join(e["text"] for e in entries).strip()
+                        x0 = min(e["bbox"][0] for e in entries)
+                        y0 = min(e["bbox"][1] for e in entries)
+                        x1 = max(e["bbox"][2] for e in entries)
+                        y1 = max(e["bbox"][3] for e in entries)
+                    else:
+                        text_value = ""
+                        x0 = boundaries[col_idx]
+                        x1 = boundaries[col_idx + 1]
+                        y0 = top
+                        y1 = bottom
+
+                    row_text_upper_parts.append(text_value.upper())
+                    cells.append({
+                        "col": col_idx,
+                        "text": text_value,
+                        "bbox": (x0, y0, x1, y1),
+                    })
+
+                row_text_upper = " ".join(part for part in row_text_upper_parts if part)
+                rows_draft.append({
+                    "block": block_index,
+                    "cells": cells,
+                    "cy": (top + bottom) / 2.0,
+                    "text_upper": row_text_upper,
+                })
+
+            if rows_draft:
+                block_results.append({
+                    "rows": rows_draft,
+                    "bbox": (block["x0"], block["y0"], block["x1"], block["y1"]),
+                })
+
+        combined_rows: List[Dict[str, Any]] = []
+        block_bboxes: List[Tuple[float, float, float, float]] = []
+
+        for result in block_results:
+            block_bboxes.append(result["bbox"])
+            combined_rows.extend(result["rows"])
+
+        if not combined_rows:
+            return None
+
+        combined_rows.sort(key=lambda row: (row["block"], row["cy"]))
+
+        header_keywords = [kw.upper() for kw in config.bom_expected_headers]
+        header_threshold = max(3, len(header_keywords) // 2)
+        header_idx = None
+
+        for idx, row in enumerate(combined_rows):
+            score = sum(1 for kw in header_keywords if kw in row["text_upper"])
+            if score >= header_threshold:
+                header_idx = idx
+                break
+
+        if header_idx is None:
+            return None
+
+        data_rows_info = [
+            row for idx, row in enumerate(combined_rows)
+            if row["text_upper"] and sum(1 for kw in header_keywords if kw in row["text_upper"]) < header_threshold
+        ]
+
+        if not data_rows_info:
+            return None
+
+        data_rows_info.sort(key=lambda row: (row["block"], row["cy"]))
+
+        if block_bboxes:
+            global_x0 = min(b[0] for b in block_bboxes)
+            global_y0 = min(b[1] for b in block_bboxes)
+            global_x1 = max(b[2] for b in block_bboxes)
+            global_y1 = max(b[3] for b in block_bboxes)
+        else:
+            global_x0, global_y0, global_x1, global_y1 = 0.0, 0.0, page_vectors.width, page_vectors.height
+
+        headers = list(config.bom_expected_headers)
+        table_rows: List[TableRow] = []
+
+        for row_idx, row in enumerate(data_rows_info):
+            cell_objs: List[TableCell] = []
+            for cell in row["cells"]:
+                cell_objs.append(TableCell(
+                    row=row_idx,
+                    col=cell["col"],
+                    text=cell["text"],
+                    bbox=cell["bbox"],
+                    confidence=1.0,
+                ))
+
+            if cell_objs:
+                row_bbox = (
+                    min(c.bbox[0] for c in cell_objs),
+                    min(c.bbox[1] for c in cell_objs),
+                    max(c.bbox[2] for c in cell_objs),
+                    max(c.bbox[3] for c in cell_objs),
+                )
+            else:
+                row_bbox = (global_x0, row["cy"], global_x1, row["cy"])
+
+            table_rows.append(TableRow(row_index=row_idx, cells=cell_objs, bbox=row_bbox))
+
+        if not table_rows:
+            return None
+
+        table = Table(
+            table_id=f"table_{page_index}_grid",
+            table_type="bom",
+            page=page_vectors.page_number,
+            bbox=(global_x0, global_y0, global_x1, global_y1),
+            headers=headers,
+            rows=table_rows,
+            metadata={
+                "num_rows": len(table_rows),
+                "num_cols": len(headers),
+                "detection_method": "grid",
+                "blocks": len(block_results),
+            }
+        )
+
+        return table
+
     def detect_table_regions(
         self,
         pdf_path: str,
@@ -503,15 +975,53 @@ class TableExtractor:
                     # Convert to PDF coords
                     return [(x0/zoom, y0/zoom, x1/zoom, y1/zoom)]
 
-        # TODO: Add text-based table detection (look for header keywords)
+        # Text-based BOM detection for engineering drawings
+        # Look for "PARTS LIST" text and find table region above it
+        doc = fitz.open(pdf_path)
+        page = doc[page_index]
 
+        # Search for BOM indicators
+        bom_keywords = ["PARTS LIST", "BILL OF MATERIALS", "BOM", "MATERIAL LIST"]
+
+        for keyword in bom_keywords:
+            text_instances = page.search_for(keyword)
+
+            if text_instances:
+                # Found BOM title - estimate table region
+                # Typically, BOM tables are in the bottom-right corner of engineering drawings
+
+                for title_bbox in text_instances:
+                    # Get page dimensions
+                    page_width = page.rect.width
+                    page_height = page.rect.height
+
+                    # BOM tables typically extend:
+                    # - From right edge inward (usually 40-60% of page width)
+                    # - From bottom upward to about 20-60% of page height
+
+                    title_y = title_bbox.y1  # Bottom of title text
+
+                    # Estimate table region:
+                    # - Right edge to left (assume table is ~50% of page width)
+                    # - From title upward (assume table is up to 50% of page height)
+
+                    x0 = page_width * 0.05  # 5% margin from left
+                    y0 = max(0, title_y - (page_height * 0.6))  # Up to 60% of page height
+                    x1 = page_width * 0.95  # 95% of page width
+                    y1 = title_y + 20  # Include title area
+
+                    doc.close()
+                    return [(x0, y0, x1, y1)]
+
+        doc.close()
         return []
 
     def extract_table(
         self,
         pdf_path: str,
         page_index: int,
-        table_bbox: Optional[Tuple[float, float, float, float]] = None
+        table_bbox: Optional[Tuple[float, float, float, float]] = None,
+        page_vectors: Optional[Any] = None,
     ) -> Optional[Table]:
         """
         Extract a single table from a page.
@@ -524,7 +1034,13 @@ class TableExtractor:
         Returns:
             Table object or None if extraction failed
         """
-        # Render page
+        # Try grid reconstruction using vector geometries first
+        if page_vectors is not None:
+            table_from_vectors = self._extract_bom_from_vectors(page_vectors, page_index, table_bbox)
+            if table_from_vectors:
+                return table_from_vectors
+
+        # Render page for legacy detection / OCR fallback
         doc = fitz.open(pdf_path)
         page = doc[page_index]
         zoom = self.config.dpi / 72.0
@@ -630,15 +1146,75 @@ class TableExtractor:
                 rows_by_idx[cell.row] = []
             rows_by_idx[cell.row].append(cell)
 
-        # Extract headers (first row)
+        # Detect header location for engineering drawings
+        # Engineering BOMs often have headers at BOTTOM with "PARTS LIST" title below headers
+        header_row_idx = None
         headers = []
-        if 0 in rows_by_idx:
-            header_cells = sorted(rows_by_idx[0], key=lambda c: c.col)
-            headers = [cell.text for cell in header_cells]
+        is_bottom_up_bom = False
 
-        # Build rows (skip header row)
+        if rows_by_idx:
+            min_row = min(rows_by_idx.keys())
+            max_row = max(rows_by_idx.keys())
+
+            # Check if this looks like an engineering drawing BOM (bottom-up format)
+            # Look for:
+            # 1. "PARTS LIST" or "BOM" text near the bottom
+            # 2. Standard BOM column headers (ITEM, QTY, PART NUMBER, DESCRIPTION) near bottom
+            # 3. Data rows above the headers
+
+            # Check last few rows for BOM indicators
+            last_row_text = " ".join(cell.text.upper() for cell in rows_by_idx.get(max_row, []))
+            second_last_row = max_row - 1 if max_row > 0 else max_row
+            second_last_text = " ".join(cell.text.upper() for cell in rows_by_idx.get(second_last_row, [])) if second_last_row in rows_by_idx else ""
+
+            # Scoring for bottom-up BOM detection
+            bom_title_keywords = ["PARTS LIST", "BILL OF MATERIALS", "BOM", "MATERIAL LIST"]
+            bom_header_keywords = ["ITEM", "QTY", "QUANTITY", "PART NUMBER", "DESCRIPTION", "MATERIAL", "ZONE", "FIND"]
+
+            # Check if last row is a title row (centered, contains "PARTS LIST")
+            last_row_has_title = any(kw in last_row_text for kw in bom_title_keywords)
+
+            # Check if second-to-last row has BOM headers
+            header_score_second_last = sum(1 for kw in bom_header_keywords if kw in second_last_text)
+
+            # If we find "PARTS LIST" at bottom AND headers above it, it's a bottom-up BOM
+            if last_row_has_title and header_score_second_last >= 3 and second_last_row in rows_by_idx:
+                # Bottom-up engineering drawing BOM
+                is_bottom_up_bom = True
+                header_row_idx = second_last_row
+                header_cells = sorted(rows_by_idx[second_last_row], key=lambda c: c.col)
+                headers = [cell.text for cell in header_cells]
+
+            # If no title row, check if last row itself has strong header keywords
+            elif not last_row_has_title:
+                header_score_last = sum(1 for kw in bom_header_keywords if kw in last_row_text)
+                header_score_first = sum(1 for kw in bom_header_keywords if kw in " ".join(cell.text.upper() for cell in rows_by_idx.get(min_row, [])))
+
+                if header_score_last >= 3 and header_score_last > header_score_first:
+                    # Bottom-up BOM without separate title row
+                    is_bottom_up_bom = True
+                    header_row_idx = max_row
+                    header_cells = sorted(rows_by_idx[max_row], key=lambda c: c.col)
+                    headers = [cell.text for cell in header_cells]
+
+            # Default: headers at top (standard table format)
+            if header_row_idx is None and min_row in rows_by_idx:
+                header_row_idx = min_row
+                header_cells = sorted(rows_by_idx[min_row], key=lambda c: c.col)
+                headers = [cell.text for cell in header_cells]
+
+        # Build rows (skip header row and title row for bottom-up BOMs)
+        rows_to_skip = {header_row_idx} if header_row_idx is not None else set()
+
+        # If bottom-up BOM, also skip the last row if it's a title row
+        if is_bottom_up_bom and rows_by_idx:
+            max_row = max(rows_by_idx.keys())
+            last_row_text = " ".join(cell.text.upper() for cell in rows_by_idx.get(max_row, []))
+            if any(kw in last_row_text for kw in ["PARTS LIST", "BILL OF MATERIALS", "BOM"]):
+                rows_to_skip.add(max_row)
+
         for row_idx in sorted(rows_by_idx.keys()):
-            if row_idx == 0:  # Skip header
+            if row_idx in rows_to_skip:
                 continue
 
             cells = sorted(rows_by_idx[row_idx], key=lambda c: c.col)
@@ -680,7 +1256,8 @@ class TableExtractor:
     def extract_all_tables(
         self,
         pdf_path: str,
-        page_indices: Optional[List[int]] = None
+        page_indices: Optional[List[int]] = None,
+        vector_map: Optional[Any] = None,
     ) -> List[Table]:
         """
         Extract all tables from PDF.
@@ -701,6 +1278,14 @@ class TableExtractor:
 
         all_tables = []
 
+        vector_lookup = {}
+        if vector_map is not None:
+            for pg in getattr(vector_map, "pages", []):
+                try:
+                    vector_lookup[pg.page_number - 1] = pg
+                except AttributeError:
+                    continue
+
         for page_idx in page_indices:
             # Detect table regions
             regions = self.detect_table_regions(pdf_path, page_idx)
@@ -708,13 +1293,17 @@ class TableExtractor:
             if regions:
                 # Extract tables from detected regions
                 for region in regions:
-                    table = self.extract_table(pdf_path, page_idx, region)
+                    page_vectors = vector_lookup.get(page_idx)
+                    table = self.extract_table(pdf_path, page_idx, region, page_vectors=page_vectors)
                     if table:
+                        table.table_id = f"table_{page_idx}_{len(all_tables)}"
                         all_tables.append(table)
             else:
                 # Try extracting from full page
-                table = self.extract_table(pdf_path, page_idx)
+                page_vectors = vector_lookup.get(page_idx)
+                table = self.extract_table(pdf_path, page_idx, page_vectors=page_vectors)
                 if table:
+                    table.table_id = f"table_{page_idx}_{len(all_tables)}"
                     all_tables.append(table)
 
         self.tables = all_tables

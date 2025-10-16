@@ -1,4 +1,4 @@
-﻿"""PDF Revision Diff - Local Streamlit UI (all local)
+"""PDF Revision Diff - Local Streamlit UI (all local)
 
 Usage
 -----
@@ -74,6 +74,7 @@ try:
         delete_document,
         export_document_text,
         get_document_text_with_coords,
+        get_vectormap,
         list_documents,
         upsert_vectormap,
     )
@@ -289,43 +290,47 @@ with workspace_tab:
                                 key=f"debug_{file_idx}_{completed_pages}"
                             )
 
-                    if enable_ocr:
-                        # Try with requested workers, fallback to fewer workers if it crashes
-                        workers_to_try = [num_workers, max(1, num_workers // 2), 1]
-                        vectormap = None
+                    # Unified extraction with fallback logic (applies to both OCR and non-OCR paths)
+                    # Try with requested workers, fallback to fewer workers if process pool crashes
+                    workers_to_try = [num_workers, max(1, num_workers // 2), 1]
+                    vectormap = None
 
-                        for attempt, worker_count in enumerate(workers_to_try, 1):
-                            try:
-                                if debug_mode and attempt > 1:
-                                    debug_messages.append(f"[{datetime.now():%H:%M:%S}] Retry {attempt} with {worker_count} worker(s)")
+                    for attempt, worker_count in enumerate(workers_to_try, 1):
+                        try:
+                            if debug_mode and attempt > 1:
+                                debug_messages.append(f"[{datetime.now():%H:%M:%S}] Retry {attempt} with {worker_count} worker(s)")
 
+                            # Choose extraction function based on OCR setting
+                            if enable_ocr:
                                 vectormap = pdf_to_vectormap(
                                     str(target_path),
                                     workers=worker_count,
                                     enable_ocr=True,
                                 )
-                                if debug_mode:
-                                    debug_messages.append(f"[{datetime.now():%H:%M:%S}] OCR-enabled extraction complete with {worker_count} worker(s)")
-                                page_progress_bar.progress(1.0, text="Extraction complete")
-                                break  # Success!
+                            else:
+                                vectormap = pdf_to_vectormap_server(
+                                    str(target_path),
+                                    workers=worker_count,
+                                    progress_callback=update_progress,
+                                )
 
-                            except Exception as worker_exc:
-                                if debug_mode:
-                                    debug_messages.append(f"[{datetime.now():%H:%M:%S}] Extraction failed with {worker_count} workers: {worker_exc}")
+                            if debug_mode:
+                                ocr_status = "OCR-enabled" if enable_ocr else "Standard"
+                                debug_messages.append(f"[{datetime.now():%H:%M:%S}] {ocr_status} extraction complete with {worker_count} worker(s)")
+                            page_progress_bar.progress(1.0, text="Extraction complete")
+                            break  # Success!
 
-                                # If this was the last attempt, re-raise
-                                if attempt == len(workers_to_try):
-                                    raise worker_exc
+                        except Exception as worker_exc:
+                            if debug_mode:
+                                debug_messages.append(f"[{datetime.now():%H:%M:%S}] Extraction failed with {worker_count} workers: {worker_exc}")
 
-                                # Otherwise, warn and try again with fewer workers
-                                with status_container:
-                                    st.warning(f"Process pool crashed with {worker_count} workers. Retrying with {workers_to_try[attempt]}...")
-                    else:
-                        vectormap = pdf_to_vectormap_server(
-                            str(target_path),
-                            workers=num_workers,
-                            progress_callback=update_progress,
-                        )
+                            # If this was the last attempt, re-raise
+                            if attempt == len(workers_to_try):
+                                raise worker_exc
+
+                            # Otherwise, warn and try again with fewer workers
+                            with status_container:
+                                st.warning(f"Process pool crashed with {worker_count} workers. Retrying with {workers_to_try[attempt]}...")
 
                     if debug_mode:
                         debug_messages.append(f"[{datetime.now():%H:%M:%S}] Writing to database")
@@ -559,87 +564,112 @@ with workspace_tab:
                         page_indices = None
 
                     if page_indices is not None:
-                        with st.spinner("Extracting BOM from drawing..."):
-                            try:
-                                # Configure for BOM extraction
-                                config = TableExtractionConfig(
-                                    dpi=bom_dpi,
-                                    ocr_min_conf=40,
-                                    enable_line_detection=True,
-                                    enable_whitespace_detection=True,
-                                    bom_keywords=[
-                                        "PARTS LIST", "BILL OF MATERIALS", "BOM", "MATERIAL LIST",
-                                        "ITEM", "QTY", "QUANTITY", "PART NUMBER", "DESCRIPTION", "PART NO",
-                                        "PART#", "P/N", "PN", "MATL", "MATERIAL"
-                                    ]
-                                )
+                        invalid_pages = [idx + 1 for idx in page_indices if idx < 0 or idx >= page_count]
+                        if invalid_pages:
+                            st.error(
+                                "Page number(s) out of range: "
+                                + ", ".join(str(p) for p in invalid_pages)
+                            )
+                        else:
+                            with st.spinner("Extracting BOM from drawing..."):
+                                try:
+                                    config = TableExtractionConfig(
+                                        dpi=bom_dpi,
+                                        ocr_min_conf=40,
+                                        enable_line_detection=True,
+                                        enable_whitespace_detection=True,
+                                        bom_keywords=[
+                                            "PARTS LIST", "BILL OF MATERIALS", "BOM", "MATERIAL LIST",
+                                            "ITEM", "QTY", "QUANTITY", "PART NUMBER", "DESCRIPTION", "PART NO",
+                                            "PART#", "P/N", "PN", "MATL", "MATERIAL"
+                                        ]
+                                    )
 
-                                # Extract tables
-                                extractor = TableExtractor(config)
-                                tables = extractor.extract_all_tables(doc_path, page_indices=page_indices)
+                                    page_numbers = sorted({idx + 1 for idx in page_indices})
 
-                                if not tables:
-                                    st.warning("No tables found on the selected page(s).")
-                                else:
-                                    # Get BOM tables
-                                    bom_tables = [t for t in tables if t.table_type == "bom"]
+                                    vectormap = get_vectormap(backend, bom_doc_id, page_numbers=page_numbers)
 
-                                    if not bom_tables:
-                                        st.warning(f"Found {len(tables)} table(s) but none identified as BOM. Showing all tables.")
-                                        bom_tables = tables
-
-                                    st.success(f"Found {len(bom_tables)} BOM table(s)")
-
-                                    # Create CSV
-                                    try:
-                                        import pandas as pd
-                                        import io
-
-                                        all_bom_rows = []
-                                        for table in bom_tables:
-                                            df = table.to_dataframe()
-                                            if not df.empty:
-                                                df.insert(0, "Page", table.page)
-                                                all_bom_rows.append(df)
-
-                                        if all_bom_rows:
-                                            combined_bom = pd.concat(all_bom_rows, ignore_index=True)
-
-                                            # Show preview
-                                            st.dataframe(combined_bom, use_container_width=True, height=300)
-
-                                            # Generate CSV
-                                            csv_buffer = io.StringIO()
-                                            combined_bom.to_csv(csv_buffer, index=False)
-                                            csv_data = csv_buffer.getvalue()
-
-                                            # Download button
-                                            filename = Path(doc_path).stem
-                                            st.download_button(
-                                                label="📥 Download BOM CSV",
-                                                data=csv_data,
-                                                file_name=f"{filename}_BOM.csv",
-                                                mime="text/csv",
-                                                type="primary",
-                                                key="download_bom_csv"
+                                    if vectormap is None or not vectormap.pages:
+                                        vectormap = pdf_to_vectormap(
+                                            doc_path,
+                                            doc_id=bom_doc_id,
+                                            workers=1,
+                                            enable_ocr=True,
+                                        )
+                                        try:
+                                            upsert_vectormap(backend, vectormap)
+                                        except Exception as upsert_exc:
+                                            st.warning(
+                                                f"Re-ingested vectormap locally but failed to persist: {upsert_exc}"
                                             )
 
-                                            st.success(f"✅ BOM extracted: {len(combined_bom)} rows")
-                                        else:
-                                            st.error("No data extracted from tables")
+                                    extractor = TableExtractor(config)
+                                    tables = extractor.extract_all_tables(
+                                        doc_path,
+                                        page_indices=page_indices,
+                                        vector_map=vectormap,
+                                    )
 
-                                    except ImportError:
-                                        st.error("pandas is required for CSV export. Please rebuild Docker container.")
-                                    except Exception as e:
-                                        st.error(f"CSV generation failed: {e}")
-                                        import traceback
-                                        st.code(traceback.format_exc())
+                                    if not tables:
+                                        st.warning("No tables found on the selected page(s).")
+                                    else:
+                                        bom_tables = [t for t in tables if t.table_type == "bom"]
+                                        if not bom_tables:
+                                            st.warning(
+                                                f"Found {len(tables)} table(s) but none identified as BOM. Showing all tables."
+                                            )
+                                            bom_tables = tables
 
-                            except Exception as exc:
-                                st.error(f"BOM extraction failed: {exc}")
-                                import traceback
-                                st.code(traceback.format_exc())
+                                        st.success(f"Found {len(bom_tables)} BOM table(s)")
 
+                                        try:
+                                            import pandas as pd
+                                            import io
+
+                                            all_bom_rows = []
+                                            for table in bom_tables:
+                                                df = table.to_dataframe()
+                                                if not df.empty:
+                                                    df.insert(0, "Page", table.page)
+                                                    all_bom_rows.append(df)
+
+                                            if all_bom_rows:
+                                                combined_bom = pd.concat(all_bom_rows, ignore_index=True)
+
+                                                st.dataframe(combined_bom, use_container_width=True, height=300)
+
+                                                csv_buffer = io.StringIO()
+                                                combined_bom.to_csv(csv_buffer, index=False)
+                                                csv_data = csv_buffer.getvalue()
+
+                                                filename = Path(doc_path).stem
+                                                output_csv = outputs_dir / f"{filename}_BOM.csv"
+                                                output_csv.write_text(csv_data, encoding="utf-8")
+
+                                                st.download_button(
+                                                    label="?? Download BOM CSV",
+                                                    data=csv_data,
+                                                    file_name=f"{filename}_BOM.csv",
+                                                    mime="text/csv",
+                                                    type="primary",
+                                                    key="download_bom_csv"
+                                                )
+
+                                                st.success(f"? BOM extracted: {len(combined_bom)} rows")
+                                            else:
+                                                st.error("No data extracted from tables")
+
+                                        except ImportError:
+                                            st.error("pandas is required for CSV export. Please rebuild Docker container.")
+                                        except Exception as e:
+                                            st.error(f"CSV generation failed: {e}")
+                                            import traceback
+                                            st.code(traceback.format_exc())
+
+                                except Exception as exc:
+                                    st.error(f"BOM extraction failed: {exc}")
+                                    import traceback
+                                    st.code(traceback.format_exc())
     st.subheader("5) Advanced Table Extraction")
     with st.expander("Table extraction from drawings", expanded=False):
         st.caption("Extract Bills of Materials, parts lists, symbol legends, and other tabular data from engineering drawings")
@@ -693,7 +723,29 @@ with workspace_tab:
                         page_indices = None if extract_all_pages else [page_for_table - 1]
 
                         try:
-                            tables = extractor.extract_all_tables(doc_path, page_indices=page_indices)
+                            page_numbers = None if page_indices is None else [idx + 1 for idx in page_indices]
+
+                            vectormap = get_vectormap(backend, table_doc_id, page_numbers=page_numbers)
+
+                            if vectormap is None or not vectormap.pages:
+                                vectormap = pdf_to_vectormap(
+                                    doc_path,
+                                    doc_id=table_doc_id,
+                                    workers=1,
+                                    enable_ocr=True,
+                                )
+                                try:
+                                    upsert_vectormap(backend, vectormap)
+                                except Exception as upsert_exc:
+                                    st.warning(
+                                        f"Re-ingested vectormap locally but failed to persist: {upsert_exc}"
+                                    )
+
+                            tables = extractor.extract_all_tables(
+                                doc_path,
+                                page_indices=page_indices,
+                                vector_map=vectormap,
+                            )
 
                             if not tables:
                                 st.warning("No tables detected in the selected pages.")

@@ -4,18 +4,19 @@ Provides ORM-based storage for PDF vector data with full-text search support.
 """
 
 from __future__ import annotations
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import json
 import os
 import random
 from contextlib import contextmanager
+from collections import defaultdict
 
 from sqlalchemy import create_engine, text, select, delete
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool, StaticPool
 
 from .db_models import Base, Document, Page, GeometryRow, TextRow, Meta
-from .models import VectorMap, GeoKind
+from .models import VectorMap, GeoKind, VectorGeom, TextRun, PageVectors, DocMeta
 
 
 class DatabaseBackend:
@@ -237,6 +238,101 @@ class DatabaseBackend:
         with self.read_session() as session:
             docs = session.query(Document).order_by(Document.doc_id.desc()).all()
             return [(d.doc_id, d.path, d.page_count) for d in docs]
+
+    def get_vectormap(
+        self,
+        doc_id: str,
+        page_numbers: Optional[List[int]] = None,
+    ) -> Optional[VectorMap]:
+        """Reconstruct a VectorMap from stored document data."""
+
+        with self.SessionLocal() as session:
+            doc = session.get(Document, doc_id)
+            if not doc:
+                return None
+
+            page_filter = None
+            if page_numbers:
+                page_filter = sorted({int(p) for p in page_numbers if p is not None})
+                if not page_filter:
+                    page_filter = None
+
+            pages_query = session.query(Page).filter(Page.doc_id == doc_id)
+            if page_filter:
+                pages_query = pages_query.filter(Page.page_number.in_(page_filter))
+
+            page_rows = pages_query.order_by(Page.page_number).all()
+            if not page_rows:
+                return None
+
+            geom_query = session.query(GeometryRow).filter(GeometryRow.doc_id == doc_id)
+            text_query = session.query(TextRow).filter(TextRow.doc_id == doc_id)
+
+            if page_filter:
+                geom_query = geom_query.filter(GeometryRow.page_number.in_(page_filter))
+                text_query = text_query.filter(TextRow.page_number.in_(page_filter))
+
+            geom_rows = geom_query.order_by(GeometryRow.page_number, GeometryRow.id).all()
+            text_rows = text_query.order_by(TextRow.page_number, TextRow.id).all()
+
+            geom_map: Dict[int, List[VectorGeom]] = defaultdict(list)
+            for row in geom_rows:
+                try:
+                    kind = GeoKind(row.kind)
+                except ValueError:
+                    continue
+                bbox = (
+                    float(row.x0 or 0.0),
+                    float(row.y0 or 0.0),
+                    float(row.x1 or 0.0),
+                    float(row.y1 or 0.0),
+                )
+                geom_map[row.page_number].append(
+                    VectorGeom(kind=kind, wkb=row.wkb, bbox=bbox)
+                )
+
+            text_map: Dict[int, List[TextRun]] = defaultdict(list)
+            for row in text_rows:
+                try:
+                    bbox_vals = json.loads(row.bbox) if row.bbox else None
+                    if not bbox_vals or len(bbox_vals) != 4:
+                        continue
+                except json.JSONDecodeError:
+                    continue
+                bbox = tuple(float(v) for v in bbox_vals)  # type: ignore
+                text_map[row.page_number].append(
+                    TextRun(
+                        text=row.text,
+                        bbox=bbox,  # type: ignore[arg-type]
+                        font=row.font,
+                        size=row.size,
+                    )
+                )
+
+            pages: List[PageVectors] = []
+            for page_row in page_rows:
+                page_number = page_row.page_number
+                pages.append(
+                    PageVectors(
+                        page_number=page_number,
+                        width=page_row.width or 0.0,
+                        height=page_row.height or 0.0,
+                        rotation=page_row.rotation or 0,
+                        geoms=geom_map.get(page_number, []),
+                        texts=text_map.get(page_number, []),
+                    )
+                )
+
+            pages.sort(key=lambda pg: pg.page_number)
+
+            return VectorMap(
+                meta=DocMeta(
+                    doc_id=doc.doc_id,
+                    path=doc.path,
+                    page_count=doc.page_count,
+                ),
+                pages=pages,
+            )
 
     def delete_document(self, doc_id: str) -> bool:
         """

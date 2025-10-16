@@ -43,7 +43,8 @@ RUN pip install --no-cache-dir --timeout=1000 \
     "numpy>=1.26,<3" \
     "pillow>=10.3,<12" \
     "typer>=0.12,<1.0" \
-    "streamlit>=1.32,<1.51"
+    "streamlit>=1.32,<1.51" \
+    "threadpoolctl>=3.1.0,<4.0"
 
 # Stage 2: Image processing and OCR
 RUN pip install --no-cache-dir --timeout=1000 \
