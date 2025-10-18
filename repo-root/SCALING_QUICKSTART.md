@@ -203,7 +203,7 @@ from pdf_compare.db_backend import create_backend
 backend = create_backend(os.getenv("DATABASE_URL"))
 
 # Read operations automatically use replicas
-docs = backend.list_documents()  # Uses read replica
+docs = backend.list_documents()  # Reads from primary for fresh results
 results = backend.search_text("query")  # Uses read replica
 
 # Write operations use primary

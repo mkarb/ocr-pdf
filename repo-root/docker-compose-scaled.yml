@@ -89,7 +89,7 @@ services:
   # OLLAMA AI SERVICE
   # ========================================================================
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:rocm
     container_name: pdf-compare-ollama
     ports:
       - "11434:11434"
@@ -99,6 +99,17 @@ services:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_NUM_PARALLEL=4
       - OLLAMA_MAX_LOADED_MODELS=2
+      - ROCM_VISIBLE_DEVICES=all
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    shm_size: 1g
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -116,7 +127,7 @@ services:
   # OLLAMA INITIALIZATION
   # ========================================================================
   ollama-init:
-    image: ollama/ollama:latest
+    image: ollama/ollama:rocm
     container_name: pdf-compare-ollama-init
     depends_on:
       ollama:
@@ -187,10 +198,18 @@ services:
       resources:
         limits:
           cpus: '8'
-          memory: 4g
+          memory: 12g  # Increased for high-DPI tiled OCR (1200 DPI)
         reservations:
-          cpus: '2'
-          memory: 1g
+          cpus: '3'
+          memory: 4g
+        # GPU support for EasyOCR (requires nvidia-docker)
+        # Uncomment to enable GPU acceleration:
+        # reservations:
+        #   devices:
+        #     - driver: nvidia
+        #       count: 1
+        #       capabilities: [gpu]
+    shm_size: 512mb  # Shared memory for image processing
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s
@@ -245,7 +264,7 @@ services:
     image: grafana/grafana:latest
     container_name: pdf-compare-grafana
     ports:
-      - "3000:3000"
+      - ":3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana
     environment:

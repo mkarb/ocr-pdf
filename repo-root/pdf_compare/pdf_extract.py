@@ -133,7 +133,7 @@ def _drawings_to_geoms(
     return out
 
 
-def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index: Optional[int] = None, enable_ocr: bool = False) -> List[Dict[str, Any]]:
+def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index: Optional[int] = None, enable_ocr: bool = False, ocr_dpi: int = 400) -> List[Dict[str, Any]]:
     """
     Extract native text spans as plain dicts: {"text": str, "bbox": (x0,y0,x1,y1), "font": str|None, "size": float|None}
     Optionally runs OCR if enable_ocr=True and minimal native text is found.
@@ -149,57 +149,79 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
                 bbox = tuple(span["bbox"])  # type: ignore
                 runs.append({"text": txt, "bbox": bbox, "font": span.get("font"), "size": span.get("size"), "source": "native"})
 
+    # Debug logging for OCR decision
+    if enable_ocr:
+        import sys
+        print(f"OCR: page {page_index+1 if page_index is not None else '?'}: Found {len(runs)} native text spans (threshold: 20)", file=sys.stderr)
+        if len(runs) >= 20:
+            print(f"OCR: page {page_index+1}: Skipping OCR (sufficient native text found)", file=sys.stderr)
+
     # Run OCR if enabled and little native text was found
     if enable_ocr and len(runs) < 20 and pdf_path and page_index is not None:
         try:
-            from .analyzers import highres_ocr, HighResOCRConfig
+            from .analyzers import highres_ocr, tiled_ocr, HighResOCRConfig
 
-            # Calculate dynamic DPI based on page dimensions
-            # Large engineering drawings need higher DPI for small text
+            # Get page dimensions
             page_width = page.rect.width
             page_height = page.rect.height
-            page_diagonal = (page_width ** 2 + page_height ** 2) ** 0.5
 
-            # DPI scaling strategy:
-            # - Small pages (letter/A4, ~800-1200pts diagonal): 400 DPI
-            # - Medium pages (tabloid, ~1200-1800pts): 500 DPI
-            # - Large pages (engineering drawings, >1800pts): 600-800 DPI
-            # - Extra large pages (>3000pts): 800+ DPI
-            if page_diagonal < 1200:
-                dpi = 400
-            elif page_diagonal < 1800:
-                dpi = 500
-            elif page_diagonal < 2500:
-                dpi = 600
-            elif page_diagonal < 3500:
-                dpi = 700
-            else:
-                dpi = 800
+            # Use user-requested DPI (no capping here - tiled OCR handles it)
+            dpi = ocr_dpi
 
-            # PSM 11 = Sparse text, finds as much text as possible (best for drawings)
-            config = HighResOCRConfig(dpi=dpi, psm=11, min_conf=60)
+            # Check if tiling is needed at requested DPI
+            TESSERACT_PIXEL_LIMIT = 29000
+            zoom = dpi / 72.0
+            pixel_width = page_width * zoom
+            pixel_height = page_height * zoom
+            needs_tiling = (pixel_width > TESSERACT_PIXEL_LIMIT or pixel_height > TESSERACT_PIXEL_LIMIT)
 
             import sys
-            print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts, diagonal={page_diagonal:.0f}, using DPI={dpi}", file=sys.stderr)
+            if needs_tiling:
+                # Use tiled OCR for large pages
+                print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using tiled OCR at {dpi} DPI (page too large for single tile)", file=sys.stderr)
 
-            ocr_results = highres_ocr(pdf_path, page_index, config)
+                ocr_results, report = tiled_ocr(
+                    pdf_path=pdf_path,
+                    page_index=page_index,
+                    dpi=dpi,
+                    psm=11,
+                    min_conf=50,  # Lowered from 60 to capture more text (some may be lower confidence)
+                    overlap_pct=0.35,  # Increased from 0.20 to better capture text at boundaries
+                    skip_empty=True,
+                    max_workers=1,  # Serial in Streamlit
+                    return_report=True,
+                    use_dual_psm=True,  # Use both PSM 11 and PSM 6 for better text capture (Tesseract only)
+                    engine="easyocr",   # Use EasyOCR for better accuracy on small text
+                    use_gpu=True        # Enable GPU acceleration
+                )
 
-            # Add OCR results
+                print(f"OCR: page {page_index+1}: Tiled OCR complete - {report.tiles_processed}/{report.total_tiles} tiles processed, {report.tiles_skipped_empty} skipped, {len(ocr_results)} text items, {report.duplicates_removed} duplicates removed", file=sys.stderr)
+
+            else:
+                # Use whole-page OCR for pages that fit
+                print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using whole-page OCR at {dpi} DPI", file=sys.stderr)
+
+                config = HighResOCRConfig(dpi=dpi, psm=11, min_conf=50, engine="easyocr", use_gpu=True)
+                ocr_results = highres_ocr(pdf_path, page_index, config)
+
+                print(f"OCR: page {page_index+1}: Extracted {len(ocr_results)} text items", file=sys.stderr)
+
+            # Add OCR results to runs
             for ocr_text in ocr_results:
                 runs.append({
-                    "text": ocr_text["text"],
-                    "bbox": ocr_text["bbox"],
+                    "text": ocr_text.get("text", ""),
+                    "bbox": ocr_text.get("bbox", (0, 0, 0, 0)),
                     "font": None,
                     "size": None,
                     "source": "ocr"
                 })
 
-            print(f"OCR: extracted {len(ocr_results)} text items from page {page_index+1}", file=sys.stderr)
-
         except Exception as e:
             # Log OCR errors but don't break extraction
             import sys
+            import traceback
             print(f"OCR warning for page {page_index}: {e}", file=sys.stderr)
+            print(f"OCR traceback: {traceback.format_exc()}", file=sys.stderr)
 
     return runs
 
@@ -214,6 +236,7 @@ def _extract_page_job(
     bezier_samples: int,
     simplify_tolerance: Optional[float],
     enable_ocr: bool = False,
+    ocr_dpi: int = 400,
 ) -> Dict[str, Any]:
     """
     Isolated worker: Extract one page → return pure Python dict.
@@ -231,7 +254,7 @@ def _extract_page_job(
         bezier_samples=bezier_samples,
         simplify_tolerance=simplify_tolerance,
     )
-    texts = _extract_text(pg, pdf_path=pdf_path, page_index=page_index, enable_ocr=enable_ocr)
+    texts = _extract_text(pg, pdf_path=pdf_path, page_index=page_index, enable_ocr=enable_ocr, ocr_dpi=ocr_dpi)
 
     out = {
         "page_number": page_index + 1,
@@ -258,6 +281,7 @@ def pdf_to_vectormap(
     bezier_samples: int = DEF_BEZIER_SAMPLES,
     simplify_tolerance: Optional[float] = DEF_SIMPLIFY_TOL,
     enable_ocr: bool = False,                 # Enable OCR for engineering drawings
+    ocr_dpi: int = 400,                       # User-requested DPI for OCR (will be auto-capped)
 ) -> VectorMap:
     """
     Parallel, high-throughput ingest.
@@ -323,6 +347,7 @@ def pdf_to_vectormap(
                     bezier_samples=bezier_samples,
                     simplify_tolerance=simplify_tolerance,
                     enable_ocr=enable_ocr,
+                    ocr_dpi=ocr_dpi,
                 )
             )
     else:
@@ -338,6 +363,7 @@ def pdf_to_vectormap(
                     bezier_samples,
                     simplify_tolerance,
                     enable_ocr,
+                    ocr_dpi,
                 )
 
             page_dicts = pool.submit_throttled(

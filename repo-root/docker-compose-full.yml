@@ -38,7 +38,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_INITDB_ARGS: "--encoding=UTF8"
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -60,7 +60,7 @@ services:
     image: ollama/ollama:latest
     container_name: pdf-compare-ollama
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama-data:/root/.ollama
     environment:
@@ -133,7 +133,7 @@ services:
     image: pdf-compare-ui:latest
     container_name: pdf-compare-ui
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
     volumes:
       - ./data/uploads:/app/data/uploads
       - ./data/outputs:/app/data/outputs
@@ -165,7 +165,17 @@ services:
     networks:
       - pdf-network
     cpus: 16
-    mem_limit: 8g
+    mem_limit: 12g  # Increased for high-DPI tiled OCR
+    shm_size: 512mb  # Shared memory for image processing
+    # GPU support for EasyOCR (requires nvidia-docker)
+    # Uncomment to enable GPU acceleration:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s

@@ -12,6 +12,7 @@ threadpoolctl>=3.1.0,<4.0
 # Raster processing and OCR (required for raster_diff, raster_grid, and OCR features)
 opencv-python>=4.8,<5.0
 pytesseract>=0.3.10,<0.4
+easyocr>=1.7.0,<2.0  # GPU-accelerated OCR for better accuracy on small text
 scikit-image>=0.21.0,<0.26
 rapidfuzz>=3.0.0,<4.0  # Fuzzy string matching for symbol validation
 pandas>=2.0.0,<3.0  # Data manipulation and CSV export for table extraction

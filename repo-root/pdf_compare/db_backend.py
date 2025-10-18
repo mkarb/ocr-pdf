@@ -235,7 +235,8 @@ class DatabaseBackend:
 
     def list_documents(self) -> List[Tuple[str, str, int]]:
         """List all documents in the database."""
-        with self.read_session() as session:
+        # Use primary connection to guarantee read-after-write consistency
+        with self.SessionLocal() as session:
             docs = session.query(Document).order_by(Document.doc_id.desc()).all()
             return [(d.doc_id, d.path, d.page_count) for d in docs]
 

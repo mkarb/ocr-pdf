@@ -50,6 +50,7 @@ RUN pip install --no-cache-dir --timeout=1000 \
 RUN pip install --no-cache-dir --timeout=1000 \
     "opencv-python>=4.8,<5.0" \
     "pytesseract>=0.3.10,<0.4" \
+    "easyocr>=1.7.0,<2.0" \
     "scikit-image>=0.21.0,<0.26" \
     "rapidfuzz>=3.0.0,<4.0" \
     "pandas>=2.0.0,<3.0" \
