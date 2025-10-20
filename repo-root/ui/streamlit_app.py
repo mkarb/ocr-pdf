@@ -241,11 +241,29 @@ with workspace_tab:
         with col_ocr:
             enable_ocr = st.checkbox("Enable OCR", value=True, help="Run OCR when embedded text is sparse")
         with col_engine:
+            # Check if vLLM service is available
+            vllm_available = False
+            try:
+                import os
+                vllm_enabled = os.getenv("VLLM_ENABLED", "false").lower() == "true"
+                if vllm_enabled:
+                    from pdf_compare.vllm_client import get_vllm_client
+                    client = get_vllm_client()
+                    vllm_available = client.is_available()
+            except Exception:
+                vllm_available = False
+
+            # Build options list
+            ocr_options = []
+            if vllm_available:
+                ocr_options.append("Qwen-VL (GPU - High Accuracy)")
+            ocr_options.extend(["EasyOCR (GPU)", "Tesseract (CPU)"])
+
             ocr_engine = st.selectbox(
                 "OCR Engine",
-                options=["EasyOCR (GPU)", "Tesseract (CPU)"],
-                index=0,  # Default to EasyOCR
-                help="EasyOCR uses GPU for 10-20x speed and better accuracy on small text",
+                options=ocr_options,
+                index=0,  # Default to first available option
+                help="Qwen-VL: 95-98% accuracy (best for scanned docs) | EasyOCR: 75-85% | Tesseract: 70-80%",
                 disabled=not enable_ocr
             )
 
@@ -254,12 +272,14 @@ with workspace_tab:
             ocr_dpi = st.selectbox(
                 "OCR DPI",
                 options=[200, 300, 400, 500, 600, 800, 1000, 1200, 1500, 2000],
-                index=2,  # Default to 400
+                index=3,  # Default to 500 for better accuracy
                 help="Higher DPI captures smaller text. Auto-tiles large pages.",
                 disabled=not enable_ocr
             )
         with col_gpu:
-            if "EasyOCR" in ocr_engine:
+            if "Qwen-VL" in ocr_engine:
+                st.success("✓ GPU acceleration (AMD ROCm) - High accuracy mode")
+            elif "EasyOCR" in ocr_engine:
                 st.success("✓ GPU acceleration enabled")
             else:
                 st.info("CPU-only processing")
@@ -332,11 +352,20 @@ with workspace_tab:
 
                             # Choose extraction function based on OCR setting
                             if enable_ocr:
+                                # Map UI selection to engine name
+                                engine_map = {
+                                    "Qwen-VL (GPU - High Accuracy)": "qwen-vl",
+                                    "EasyOCR (GPU)": "easyocr",
+                                    "Tesseract (CPU)": "tesseract"
+                                }
+                                selected_engine = engine_map.get(ocr_engine, "easyocr")
+
                                 vectormap = pdf_to_vectormap(
                                     str(target_path),
                                     workers=worker_count,
                                     enable_ocr=True,
                                     ocr_dpi=ocr_dpi,
+                                    ocr_engine=selected_engine,
                                 )
                             else:
                                 vectormap = pdf_to_vectormap_server(

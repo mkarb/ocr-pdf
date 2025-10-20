@@ -40,5 +40,13 @@ pypdf>=3.17.0,<5.0
 tiktoken>=0.5.0,<0.8
 faiss-cpu>=1.7.4,<1.9  # Vector similarity search (CPU-only)
 
+# vLLM + Qwen2.5 Integration (optional, for AMD ROCm GPU acceleration)
+# Install PyTorch with ROCm first: pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+# Then install vLLM: pip install vllm
+# Note: These are optional dependencies. System will fallback to Ollama if not available.
+# vllm>=0.6.0  # Uncomment to enable GPU-accelerated inference
+# transformers>=4.40.0  # Required for vLLM
+# qwen-vl-utils>=0.0.1  # Utilities for Qwen2-VL vision models
+
 # Note: SQLite support has been removed. This project requires PostgreSQL.
 # For local development, you can use Docker Compose to run a PostgreSQL instance.

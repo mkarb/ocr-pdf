@@ -32,6 +32,16 @@ except ImportError:
     HAVE_EASYOCR = False
     _EASYOCR_READER = None
 
+# Try to import Qwen2-VL client for high-accuracy VLM-based OCR via microservice
+try:
+    from .qwen_vl_ocr_client import get_qwen_vl_ocr_client, VLLMServiceUnavailable
+    HAVE_QWEN_VL = True
+    _QWEN_VL_OCR = None
+except ImportError:
+    HAVE_QWEN_VL = False
+    _QWEN_VL_OCR = None
+    VLLMServiceUnavailable = Exception  # Fallback
+
 BBox = Tuple[float, float, float, float]  # x0,y0,x1,y1 in PDF user space
 
 @dataclass(frozen=True)
@@ -40,8 +50,8 @@ class HighResOCRConfig:
     psm: int = 11             # sparse text, as lines (Tesseract only)
     min_conf: int = 60        # filter weak OCR results
     lang: str = "eng"
-    engine: str = "tesseract" # OCR engine: "tesseract" or "easyocr"
-    use_gpu: bool = True      # Use GPU if available (EasyOCR only)
+    engine: str = "tesseract" # OCR engine: "tesseract", "easyocr", or "qwen-vl"
+    use_gpu: bool = True      # Use GPU if available (EasyOCR, Qwen-VL)
     # The following are here for future page batching; for a single page they are inert
     max_workers: int = 1
     ram_budget_mb: int = 4096
@@ -232,13 +242,62 @@ def _ocr_tile_tesseract(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
     return out
 
 
+def _ocr_tile_qwen_vl(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
+    """
+    Run Qwen2-VL on a grayscale tile via vLLM microservice.
+    Returns list of dicts: {"text": str, "bbox": (x0,y0,x1,y1), "conf": int}
+    (bbox is in TILE pixel coords; caller maps to PDF coords)
+    """
+    global _QWEN_VL_OCR
+
+    if not HAVE_QWEN_VL:
+        raise ImportError("Qwen-VL client not available")
+
+    if _QWEN_VL_OCR is None:
+        import sys
+        print(f"OCR: Connecting to vLLM service for Qwen2-VL OCR...", file=sys.stderr)
+        _QWEN_VL_OCR = get_qwen_vl_ocr_client()
+
+        # Check if service is available
+        if not _QWEN_VL_OCR.is_available():
+            print(f"OCR: WARNING - vLLM service not available, will fallback to EasyOCR/Tesseract", file=sys.stderr)
+            raise VLLMServiceUnavailable("vLLM service not available")
+
+        print(f"OCR: Connected to vLLM service", file=sys.stderr)
+
+    # Extract text using VLM service (sends HTTP request)
+    try:
+        results = _QWEN_VL_OCR.extract_text_from_image(gray, focus_technical=True)
+    except VLLMServiceUnavailable:
+        import sys
+        print(f"OCR: vLLM service unavailable, fallback required", file=sys.stderr)
+        raise  # Will cause fallback to EasyOCR/Tesseract in caller
+
+    # Convert to standard format
+    out = []
+    for item in results:
+        conf = int(item.get("confidence", 1.0) * 100)
+        if conf < cfg.min_conf:
+            continue
+
+        out.append({
+            "text": item["text"],
+            "bbox": item["bbox"],
+            "conf": conf
+        })
+
+    return out
+
+
 def _ocr_tile(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
     """
     Run OCR on a grayscale tile using configured engine.
     Returns list of dicts: {"text": str, "bbox": (x0,y0,x1,y1), "conf": int}
     (bbox is in TILE pixel coords; caller maps to PDF coords)
     """
-    if cfg.engine == "easyocr":
+    if cfg.engine == "qwen-vl":
+        return _ocr_tile_qwen_vl(gray, cfg)
+    elif cfg.engine == "easyocr":
         return _ocr_tile_easyocr(gray, cfg)
     else:
         return _ocr_tile_tesseract(gray, cfg)

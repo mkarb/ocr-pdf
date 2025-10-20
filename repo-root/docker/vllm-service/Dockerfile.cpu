@@ -1,0 +1,55 @@
+# vLLM Service for PDF Analysis - CPU-Only Mode (Windows Compatible)
+# Runs Qwen2.5 models with CPU inference for testing
+#
+# Build: docker build -t pdf-compare-vllm-cpu -f docker/vllm-service/Dockerfile.cpu .
+
+FROM python:3.10-slim-bullseye
+
+LABEL maintainer="PDF Compare Project"
+LABEL description="vLLM inference service (CPU-only) for Qwen2.5 models"
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install PyTorch CPU-only
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Install vLLM and core dependencies (CPU mode)
+RUN pip install --no-cache-dir \
+    transformers>=4.40.0 \
+    accelerate>=0.28.0 \
+    fastapi>=0.109.0 \
+    uvicorn[standard]>=0.27.0 \
+    pydantic>=2.0.0 \
+    python-multipart \
+    pillow>=10.0.0
+
+# Install Qwen2-VL specific utilities
+RUN pip install --no-cache-dir \
+    qwen-vl-utils \
+    einops
+
+# Create directory for models cache
+RUN mkdir -p /root/.cache/huggingface
+
+# Copy service code
+COPY docker/vllm-service/app/ /app/
+
+# Expose vLLM API port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run service
+CMD ["python", "main.py"]

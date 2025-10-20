@@ -9,10 +9,15 @@ param(
     [string]$Action = "up",
 
     [Parameter(Position=2)]
-    [string]$Options = ""
+    [string]$Options = "",
+
+    [switch]$NoCache
 )
 
 $ErrorActionPreference = "Continue"
+
+# Determine build flags
+$BuildFlags = if ($NoCache) { "--no-cache" } else { "" }
 
 # Color functions
 function Write-Log {
@@ -42,7 +47,8 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 switch ($Mode) {
     "standalone" {
         Write-Log "Building standalone container (all-in-one)"
-        docker-compose build pdf-compare-standalone
+        if ($NoCache) { Write-Warn "Building with --no-cache (fresh rebuild)" }
+        docker-compose build $BuildFlags pdf-compare-standalone
 
         if ($Action -eq "up") {
             Write-Log "Starting standalone container..."
@@ -53,7 +59,8 @@ switch ($Mode) {
 
     "full" {
         Write-Log "Building full deployment (Postgres + Ollama + UI)"
-        docker-compose -f docker-compose-full.yml build
+        if ($NoCache) { Write-Warn "Building with --no-cache (fresh rebuild)" }
+        docker-compose -f docker-compose-full.yml build $BuildFlags
 
         if ($Action -eq "up") {
             Write-Log "Starting full deployment..."
@@ -139,15 +146,16 @@ switch ($Mode) {
 
     "app" {
         Write-Log "Building application container only (UI + PDF Compare)"
+        if ($NoCache) { Write-Warn "Building with --no-cache (fresh rebuild)" }
 
         if ($Action -eq "build") {
             Write-Log "Building application image..."
-            docker-compose -f docker-compose-full.yml build pdf-compare-ui
+            docker-compose -f docker-compose-full.yml build $BuildFlags pdf-compare-ui
             Write-Info "Application image built successfully"
         }
         elseif ($Action -eq "up") {
             Write-Log "Building and starting application container..."
-            docker-compose -f docker-compose-full.yml build pdf-compare-ui
+            docker-compose -f docker-compose-full.yml build $BuildFlags pdf-compare-ui
             docker-compose -f docker-compose-full.yml up -d pdf-compare-ui
             Write-Info "Access UI at: http://localhost:8501"
         }
@@ -165,6 +173,7 @@ switch ($Mode) {
 
     "scaled" {
         Write-Log "Building scaled deployment (Simplified Multi-User for 7-20 Users)"
+        if ($NoCache) { Write-Warn "Building with --no-cache (fresh rebuild)" }
 
         if (-not (Test-Path ".env")) {
             Write-Warn ".env file not found. Creating from template..."
@@ -174,7 +183,7 @@ switch ($Mode) {
             Start-Sleep -Seconds 2
         }
 
-        docker-compose -f docker-compose-scaled.yml build
+        docker-compose -f docker-compose-scaled.yml build $BuildFlags
 
         if ($Action -eq "up") {
             Write-Log "Starting scaled deployment..."
@@ -225,7 +234,8 @@ switch ($Mode) {
 
     "multi-user" {
         Write-Log "Building multi-user containers (UI + worker)"
-        docker-compose --profile multi-user build
+        if ($NoCache) { Write-Warn "Building with --no-cache (fresh rebuild)" }
+        docker-compose --profile multi-user build $BuildFlags
 
         if ($Action -eq "up") {
             Write-Log "Starting multi-user deployment..."
@@ -238,7 +248,8 @@ switch ($Mode) {
 
     "worker" {
         Write-Log "Building worker container only"
-        docker-compose --profile multi-user build pdf-compare-worker
+        if ($NoCache) { Write-Warn "Building with --no-cache (fresh rebuild)" }
+        docker-compose --profile multi-user build $BuildFlags pdf-compare-worker
 
         if ($Action -eq "up") {
             $workers = if ($Options) { $Options } else { "2" }
@@ -258,7 +269,8 @@ switch ($Mode) {
 
     "test" {
         Write-Log "Running test build..."
-        docker build --target test -t pdf-compare:test .
+        if ($NoCache) { Write-Warn "Building with --no-cache (fresh rebuild)" }
+        docker build $BuildFlags --target test -t pdf-compare:test .
         docker run --rm pdf-compare:test pytest
     }
 
@@ -281,7 +293,10 @@ switch ($Mode) {
     default {
         Write-Host "PDF Compare - Build and Deployment Script (PowerShell)" -ForegroundColor Cyan
         Write-Host ""
-        Write-Host "Usage: .\build.ps1 <mode> <action> [options]" -ForegroundColor White
+        Write-Host "Usage: .\build.ps1 <mode> <action> [options] [-NoCache]" -ForegroundColor White
+        Write-Host ""
+        Write-Host "=== FLAGS ===" -ForegroundColor Yellow
+        Write-Host "  -NoCache       Force fresh rebuild (ignores Docker cache)" -ForegroundColor White
         Write-Host ""
         Write-Host "=== CONTAINER MODES ===" -ForegroundColor Yellow
         Write-Host "Production (Multi-User):" -ForegroundColor White
@@ -318,6 +333,7 @@ switch ($Mode) {
         Write-Host ""
         Write-Host "Production Multi-User Deployment:" -ForegroundColor Cyan
         Write-Host "  .\build.ps1 scaled up                  # Start scaled deployment (7-20 users)" -ForegroundColor White
+        Write-Host "  .\build.ps1 scaled up -NoCache         # Fresh rebuild scaled deployment" -ForegroundColor White
         Write-Host "  .\build.ps1 scaled up 3                # Start with 3 UI instances" -ForegroundColor White
         Write-Host "  .\build.ps1 scaled scale 5             # Scale to 5 UI instances" -ForegroundColor White
         Write-Host "  .\build.ps1 scaled logs                # View all logs" -ForegroundColor White
@@ -329,6 +345,7 @@ switch ($Mode) {
         Write-Host ""
         Write-Host "Daily Development (Fast Updates):" -ForegroundColor Cyan
         Write-Host "  .\build.ps1 app build                  # Rebuild app code only (30s)" -ForegroundColor White
+        Write-Host "  .\build.ps1 app build -NoCache         # Fresh rebuild (ignores cache)" -ForegroundColor White
         Write-Host "  .\build.ps1 app up                     # Deploy new code" -ForegroundColor White
         Write-Host "  .\build.ps1 app restart                # Quick restart without rebuild" -ForegroundColor White
         Write-Host ""

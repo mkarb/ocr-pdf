@@ -9,6 +9,16 @@ from .table_extractor import (
     TableExtractor,
 )
 
+# Optional Qwen2-VL OCR (requires vLLM)
+try:
+    from .qwen_vl_ocr import QwenVLOCR, VLOCRConfig, get_qwen_vl_ocr
+    HAVE_QWEN_VL = True
+except ImportError:
+    HAVE_QWEN_VL = False
+    QwenVLOCR = None
+    VLOCRConfig = None
+    get_qwen_vl_ocr = None
+
 __all__ = [
     # High-res OCR
     "HighResOCRConfig",
@@ -28,4 +38,9 @@ __all__ = [
     "Table",
     "TableExtractionConfig",
     "TableExtractor",
+    # Qwen2-VL OCR (optional)
+    "QwenVLOCR",
+    "VLOCRConfig",
+    "get_qwen_vl_ocr",
+    "HAVE_QWEN_VL",
 ]

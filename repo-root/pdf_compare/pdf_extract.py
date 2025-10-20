@@ -133,10 +133,13 @@ def _drawings_to_geoms(
     return out
 
 
-def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index: Optional[int] = None, enable_ocr: bool = False, ocr_dpi: int = 400) -> List[Dict[str, Any]]:
+def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index: Optional[int] = None, enable_ocr: bool = False, ocr_dpi: int = 400, ocr_engine: str = "easyocr") -> List[Dict[str, Any]]:
     """
     Extract native text spans as plain dicts: {"text": str, "bbox": (x0,y0,x1,y1), "font": str|None, "size": float|None}
     Optionally runs OCR if enable_ocr=True and minimal native text is found.
+
+    Args:
+        ocr_engine: OCR engine to use - "tesseract", "easyocr", or "qwen-vl"
     """
     runs: List[Dict[str, Any]] = []
     raw = page.get_text("dict") or {}
@@ -201,7 +204,7 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
                 # Use whole-page OCR for pages that fit
                 print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using whole-page OCR at {dpi} DPI", file=sys.stderr)
 
-                config = HighResOCRConfig(dpi=dpi, psm=11, min_conf=50, engine="easyocr", use_gpu=True)
+                config = HighResOCRConfig(dpi=dpi, psm=11, min_conf=50, engine=ocr_engine, use_gpu=True)
                 ocr_results = highres_ocr(pdf_path, page_index, config)
 
                 print(f"OCR: page {page_index+1}: Extracted {len(ocr_results)} text items", file=sys.stderr)
@@ -237,6 +240,7 @@ def _extract_page_job(
     simplify_tolerance: Optional[float],
     enable_ocr: bool = False,
     ocr_dpi: int = 400,
+    ocr_engine: str = "easyocr",
 ) -> Dict[str, Any]:
     """
     Isolated worker: Extract one page → return pure Python dict.
@@ -254,7 +258,7 @@ def _extract_page_job(
         bezier_samples=bezier_samples,
         simplify_tolerance=simplify_tolerance,
     )
-    texts = _extract_text(pg, pdf_path=pdf_path, page_index=page_index, enable_ocr=enable_ocr, ocr_dpi=ocr_dpi)
+    texts = _extract_text(pg, pdf_path=pdf_path, page_index=page_index, enable_ocr=enable_ocr, ocr_dpi=ocr_dpi, ocr_engine=ocr_engine)
 
     out = {
         "page_number": page_index + 1,
@@ -282,6 +286,7 @@ def pdf_to_vectormap(
     simplify_tolerance: Optional[float] = DEF_SIMPLIFY_TOL,
     enable_ocr: bool = False,                 # Enable OCR for engineering drawings
     ocr_dpi: int = 400,                       # User-requested DPI for OCR (will be auto-capped)
+    ocr_engine: str = "easyocr",              # OCR engine: "tesseract", "easyocr", or "qwen-vl"
 ) -> VectorMap:
     """
     Parallel, high-throughput ingest.
@@ -291,6 +296,7 @@ def pdf_to_vectormap(
     - bezier_samples: sampling density for cubic curves
     - simplify_tolerance: if set, simplifies strokes to reduce oversampled paths
     - enable_ocr: if True, runs OCR on pages with minimal native text
+    - ocr_engine: OCR engine to use - "tesseract", "easyocr", or "qwen-vl"
     """
     p = Path(path)
     if not p.exists():
@@ -364,6 +370,7 @@ def pdf_to_vectormap(
                     simplify_tolerance,
                     enable_ocr,
                     ocr_dpi,
+                    ocr_engine,
                 )
 
             page_dicts = pool.submit_throttled(
