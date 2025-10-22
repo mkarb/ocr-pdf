@@ -76,6 +76,7 @@ class TextRow(Base):
     font = Column(Text)
     size = Column(Float)
     source = Column(String, default="native")  # 'native' or 'ocr'
+    confidence = Column(Integer, nullable=True)  # 0-100 for OCR, NULL for native text
 
     # Relationships
     document = relationship("Document", back_populates="text_rows")
@@ -84,6 +85,7 @@ class TextRow(Base):
     __table_args__ = (
         Index("idx_text_rows_doc_page", "doc_id", "page_number"),
         Index("idx_text_rows_source", "source"),
+        Index("idx_text_rows_confidence", "confidence"),  # For filtering low-confidence results
     )
 
 

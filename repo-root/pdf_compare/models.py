@@ -27,6 +27,8 @@ class TextRun:
     bbox: BBox
     font: Optional[str]
     size: Optional[float]
+    confidence: Optional[int] = None  # 0-100 for OCR, None for native text
+    source: Optional[str] = None       # "native", "ocr", "ocr-tesseract", "ocr-easyocr", "ocr-qwen"
 
 @dataclass(frozen=True)
 class PageVectors:

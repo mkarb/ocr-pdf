@@ -211,12 +211,19 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
 
             # Add OCR results to runs
             for ocr_text in ocr_results:
+                # Preserve confidence from OCR engine (standardize field names)
+                confidence = ocr_text.get("conf") or ocr_text.get("confidence")
+                if confidence is not None and isinstance(confidence, float):
+                    # Convert float (0.0-1.0) to int (0-100) if needed
+                    confidence = int(confidence * 100) if confidence <= 1.0 else int(confidence)
+
                 runs.append({
                     "text": ocr_text.get("text", ""),
                     "bbox": ocr_text.get("bbox", (0, 0, 0, 0)),
                     "font": None,
                     "size": None,
-                    "source": "ocr"
+                    "source": "ocr",
+                    "confidence": confidence  # Preserve OCR confidence (0-100)
                 })
 
         except Exception as e:
@@ -397,6 +404,8 @@ def pdf_to_vectormap(
                 bbox=tuple(t["bbox"]),
                 font=t.get("font"),
                 size=t.get("size"),
+                confidence=t.get("confidence"),  # Preserve confidence from OCR
+                source=t.get("source"),  # Preserve source (native/ocr)
             )
             for t in r["texts"]
         ]

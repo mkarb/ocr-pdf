@@ -220,6 +220,10 @@ class DatabaseBackend:
                     for t in pg.texts:
                         x0, y0, x1, y1 = t.bbox
                         bbox_json = f"[{x0},{y0},{x1},{y1}]"
+
+                        # Auto-detect source if not explicitly set
+                        source = t.source if t.source else ("native" if t.confidence is None else "ocr")
+
                         text_objs.append(TextRow(
                             doc_id=vm.meta.doc_id,
                             page_number=pg.page_number,
@@ -227,7 +231,8 @@ class DatabaseBackend:
                             bbox=bbox_json,
                             font=t.font,
                             size=t.size,
-                            source="native"
+                            source=source,
+                            confidence=t.confidence  # Store OCR confidence (0-100, NULL for native)
                         ))
                     session.bulk_save_objects(text_objs)
 
@@ -307,6 +312,8 @@ class DatabaseBackend:
                         bbox=bbox,  # type: ignore[arg-type]
                         font=row.font,
                         size=row.size,
+                        confidence=row.confidence,  # Restore confidence from database
+                        source=row.source,  # Restore source (native/ocr)
                     )
                 )
 

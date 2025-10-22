@@ -164,6 +164,44 @@ st.sidebar.caption(f"Using {num_workers} worker(s) for parallel extraction")
 if HAS_PSUTIL:
     st.sidebar.caption(f"CPU load: {psutil.cpu_percent(interval=0.1)}%")
 
+# OCR Debug Mode
+st.sidebar.subheader("OCR Debug Mode")
+
+enable_ocr_debug = st.sidebar.checkbox(
+    "Enable OCR Visual Debugging",
+    value=False,
+    help="Save visual output at each OCR processing stage for tuning"
+)
+
+if enable_ocr_debug:
+    debug_output_dir = st.sidebar.text_input(
+        "Debug Output Directory",
+        value="./debug/ocr",
+        help="Directory to save debug images"
+    )
+
+    conf_threshold_low = st.sidebar.slider(
+        "Low Confidence Threshold",
+        min_value=0, max_value=100, value=70,
+        help="Text below this confidence will be marked red"
+    )
+
+    conf_threshold_high = st.sidebar.slider(
+        "High Confidence Threshold",
+        min_value=0, max_value=100, value=90,
+        help="Text above this confidence will be marked green"
+    )
+
+    # Store in session state
+    st.session_state["ocr_debug_config"] = {
+        "enabled": enable_ocr_debug,
+        "output_dir": debug_output_dir,
+        "confidence_threshold_low": conf_threshold_low,
+        "confidence_threshold_high": conf_threshold_high,
+    }
+else:
+    st.session_state["ocr_debug_config"] = {"enabled": False}
+
 
 @st.cache_resource(show_spinner=False)
 def get_db_backend() -> DatabaseBackend:

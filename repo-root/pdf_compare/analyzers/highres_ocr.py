@@ -10,6 +10,15 @@ import time
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Import debug visualizer
+try:
+    from ..debug.ocr_visualizer import OCRVisualizer, create_visualizer
+    HAVE_VISUALIZER = True
+except ImportError:
+    HAVE_VISUALIZER = False
+    OCRVisualizer = None
+    create_visualizer = None
+
 if os.name == "nt" and "tesseract.exe" not in pytesseract.pytesseract.tesseract_cmd.lower():
     default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     if os.path.exists(default):
@@ -307,13 +316,64 @@ def highres_ocr(
     page_index: int,
     cfg: HighResOCRConfig,
     tiles_pdf: Optional[List[BBox]] = None,
+    debug_visualizer: Optional['OCRVisualizer'] = None,
 ) -> List[Dict]:
     """
-    OCR one page at high DPI.
-    If tiles_pdf is provided, OCR only those regions (PDF coords).
-    Returns list of {"text": str, "bbox": (x0,y0,x1,y1)} in PDF coords.
+    OCR one page at high DPI with optional visual debugging.
+
+    Args:
+        pdf_path: Path to PDF file
+        page_index: Page index (0-based)
+        cfg: OCR configuration
+        tiles_pdf: Optional list of regions to OCR (in PDF coordinates)
+        debug_visualizer: Optional OCRVisualizer for debug output
+
+    Returns:
+        List of {"text": str, "bbox": (x0,y0,x1,y1), "conf": int} in PDF coords
     """
+    start_time = time.time()
+
+    # Initialize debug visualizer if not provided
+    if debug_visualizer is None and HAVE_VISUALIZER:
+        debug_visualizer = create_visualizer(enabled=False)
+
+    if debug_visualizer:
+        debug_visualizer.reset(page_index + 1)
+
+    # Render page
     gray, zoom = _render_page_gray(pdf_path, page_index, cfg.dpi)
+
+    # STAGE 1: Save original
+    if debug_visualizer:
+        debug_visualizer.save_original(gray, cfg.dpi)
+
+    # STAGE 2: Grayscale (already done, save it)
+    if debug_visualizer:
+        debug_visualizer.save_grayscale(gray)
+
+    # Preprocessing info for debug
+    preprocessing_info = {
+        "engine": cfg.engine,
+        "psm": cfg.psm,
+        "min_conf": cfg.min_conf,
+        "dpi": cfg.dpi
+    }
+
+    # STAGE 3: Preprocessing (for Tesseract, show preprocessing steps)
+    if cfg.engine == "tesseract" and debug_visualizer:
+        proc = cv2.bilateralFilter(gray, 9, 75, 75)
+        proc = cv2.adaptiveThreshold(proc, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                      cv2.THRESH_BINARY, 11, 2)
+        kernel = np.ones((2,2), np.uint8)
+        proc = cv2.morphologyEx(proc, cv2.MORPH_CLOSE, kernel)
+
+        preprocessing_info.update({
+            "bilateral_filter": "9x9, sigma=75",
+            "adaptive_threshold": "Gaussian, block=11",
+            "morphology": "Close, 2x2 kernel"
+        })
+
+        debug_visualizer.save_preprocessed(proc, preprocessing_info)
 
     h, w = gray.shape[:2]
     results: List[Dict] = []
@@ -335,14 +395,39 @@ def highres_ocr(
                 # map tile-pixel bbox back to PDF coords
                 X0, Y0 = (px0 + tx0) / zoom, (py0 + ty0) / zoom
                 X1, Y1 = (px0 + tx1) / zoom, (py0 + ty1) / zoom
-                results.append({"text": s["text"], "bbox": (X0, Y0, X1, Y1)})
-        return results
+                results.append({"text": s["text"], "bbox": (X0, Y0, X1, Y1), "conf": s.get("conf", 0)})
+    else:
+        # Otherwise OCR the whole page
+        spans = _ocr_tile(gray, cfg)
+        for s in spans:
+            x0, y0, x1, y1 = s["bbox"]
+            results.append({"text": s["text"], "bbox": (x0/zoom, y0/zoom, x1/zoom, y1/zoom), "conf": s.get("conf", 0)})
 
-    # Otherwise OCR the whole page
-    spans = _ocr_tile(gray, cfg)
-    for s in spans:
-        x0, y0, x1, y1 = s["bbox"]
-        results.append({"text": s["text"], "bbox": (x0/zoom, y0/zoom, x1/zoom, y1/zoom)})
+    # STAGE 4: Save detections with confidence overlay
+    if debug_visualizer:
+        debug_visualizer.save_detections(gray, [
+            {"text": r["text"], "bbox": [v*zoom for v in r["bbox"]], "conf": r.get("conf", 0)}
+            for r in results
+        ])
+
+    # STAGE 6: Save final results with text
+    if debug_visualizer:
+        debug_visualizer.save_final_with_text(gray, [
+            {"text": r["text"], "bbox": [v*zoom for v in r["bbox"]], "conf": r.get("conf", 0)}
+            for r in results
+        ])
+
+    # STAGE 7: Confidence heatmap
+    if debug_visualizer:
+        debug_visualizer.save_confidence_heatmap(w, h, [
+            {"bbox": [v*zoom for v in r["bbox"]], "conf": r.get("conf", 0)}
+            for r in results
+        ])
+
+    # Generate summary report
+    if debug_visualizer:
+        processing_time = time.time() - start_time
+        debug_visualizer.generate_summary_report(results, processing_time)
     return results
 
 
