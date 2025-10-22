@@ -37,6 +37,98 @@ Write-Host ""
 $RepoRoot = "H:\repo-root\ocr-pdf\repo-root"
 Set-Location $RepoRoot
 
+function Stop-VllmService {
+    $vllmProcesses = Get-Process -Name python -ErrorAction SilentlyContinue | Where-Object {
+        $_.CommandLine -like "*main_windows.py*"
+    }
+
+    if ($vllmProcesses) {
+        Write-Host "  Stopping existing vLLM process..." -ForegroundColor Yellow
+        foreach ($proc in $vllmProcesses) {
+            try {
+                Stop-Process -Id $proc.Id -Force
+                Write-Host "    Stopped PID $($proc.Id)" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "    Failed to stop PID $($proc.Id)" -ForegroundColor Red
+            }
+        }
+        Start-Sleep -Seconds 2
+    }
+    else {
+        Write-Host "  No running vLLM process detected" -ForegroundColor Gray
+    }
+}
+
+function Start-VllmService {
+    param(
+        [string]$RepoRoot
+    )
+
+    Write-Host ""
+    Write-Host "  Starting new vLLM service instance..." -ForegroundColor Yellow
+
+    $vllmScriptPath = Join-Path $RepoRoot "docker\vllm-service\app\main_windows.py"
+    $pythonExe = Join-Path $RepoRoot "venv-vllm-py312\Scripts\python.exe"
+
+    if (-not (Test-Path $pythonExe)) {
+        Write-Host "ERROR: Python venv not found at: $pythonExe" -ForegroundColor Red
+        exit 1
+    }
+
+    $cmd = "Set-Location '$RepoRoot'; "
+    $cmd += "`$env:HF_TOKEN='$env:HF_TOKEN'; "
+    $cmd += "`$env:VLLM_TEXT_MODEL='$env:VLLM_TEXT_MODEL'; "
+    $cmd += "`$env:VLLM_VISION_MODEL='$env:VLLM_VISION_MODEL'; "
+    $cmd += "`$env:ENABLE_VISION_OCR='$env:ENABLE_VISION_OCR'; "
+    $cmd += "`$env:PORT='$env:PORT'; "
+    $cmd += "Write-Host 'Starting Qwen Service...' -ForegroundColor Cyan; "
+    $cmd += "& '$pythonExe' '$vllmScriptPath'"
+
+    Start-Process powershell -ArgumentList "-NoExit", "-Command", $cmd
+
+    Write-Host "  Waiting for vLLM service (max 5 min)..." -ForegroundColor Yellow
+
+    $maxWait = 300
+    $waited = 0
+    $healthy = $false
+    $health = $null
+
+    while ($waited -lt $maxWait) {
+        Start-Sleep -Seconds 5
+        $waited += 5
+
+        try {
+            $response = Invoke-WebRequest -Uri "http://localhost:8000/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+            $health = $response.Content | ConvertFrom-Json
+
+            if ($health.status -eq "healthy" -and $health.text_model_loaded -eq $true -and $health.vision_model_loaded -eq $true) {
+                $healthy = $true
+                break
+            }
+        }
+        catch {
+            Write-Host "." -NoNewline -ForegroundColor Gray
+        }
+    }
+
+    Write-Host ""
+
+    if ($healthy) {
+        Write-Host "  vLLM service started successfully - Models loaded:" -ForegroundColor Green
+        Write-Host "    Text Model:   Qwen2.5-7B-Instruct (GPU)" -ForegroundColor Gray
+        Write-Host "    Vision Model: Qwen2-VL-7B-Instruct (GPU)" -ForegroundColor Gray
+        Write-Host "    GPU Count:    $($health.gpu_count)" -ForegroundColor Gray
+        return $true
+    }
+    else {
+        Write-Host "  WARNING: vLLM not responding after $maxWait seconds" -ForegroundColor Yellow
+        Write-Host "  Press Enter to continue or CTRL+C to abort..." -ForegroundColor Yellow
+        Read-Host | Out-Null
+        return $false
+    }
+}
+
 # ============================================================================
 # Step 1: Start vLLM Service
 # ============================================================================
@@ -71,6 +163,8 @@ if (-not $SkipVLLM) {
 
     # Check if vLLM service is already running
     $vllmRunning = $false
+    $startVllm = $false
+    $restartExisting = $false
     try {
         $response = Invoke-WebRequest -Uri "http://localhost:8000/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
         $health = $response.Content | ConvertFrom-Json
@@ -88,72 +182,23 @@ if (-not $SkipVLLM) {
             Write-Host ""
             Write-Host "  vLLM service found but models not loaded, restarting..." -ForegroundColor Yellow
             Write-Host ""
+            $startVllm = $true
+            $restartExisting = $true
         }
     }
     catch {
-        # Service not running, start it
-        Write-Host ""
-        Write-Host "  Starting new vLLM service instance..." -ForegroundColor Yellow
+        $startVllm = $true
+    }
 
-        $vllmScriptPath = Join-Path $RepoRoot "docker\vllm-service\app\main_windows.py"
-        $pythonExe = Join-Path $RepoRoot "venv-vllm-py312\Scripts\python.exe"
-
-        if (-not (Test-Path $pythonExe)) {
-            Write-Host "ERROR: Python venv not found at: $pythonExe" -ForegroundColor Red
-            exit 1
+    if ($startVllm) {
+        if ($restartExisting) {
+            Stop-VllmService
         }
 
-        # Create command to run in new window
-        $cmd = "Set-Location '$RepoRoot'; "
-        $cmd += "`$env:HF_TOKEN='$env:HF_TOKEN'; "
-        $cmd += "`$env:VLLM_TEXT_MODEL='$env:VLLM_TEXT_MODEL'; "
-        $cmd += "`$env:VLLM_VISION_MODEL='$env:VLLM_VISION_MODEL'; "
-        $cmd += "`$env:ENABLE_VISION_OCR='$env:ENABLE_VISION_OCR'; "
-        $cmd += "`$env:PORT='$env:PORT'; "
-        $cmd += "Write-Host 'Starting Qwen Service...' -ForegroundColor Cyan; "
-        $cmd += "& '$pythonExe' '$vllmScriptPath'"
+        $vllmRunning = Start-VllmService -RepoRoot $RepoRoot
 
-        # Start in new window
-        Start-Process powershell -ArgumentList "-NoExit", "-Command", $cmd
-
-        Write-Host "  Waiting for vLLM service (max 5 min)..." -ForegroundColor Yellow
-
-        # Wait for service
-        $maxWait = 300
-        $waited = 0
-        $healthy = $false
-
-        while ($waited -lt $maxWait) {
-            Start-Sleep -Seconds 5
-            $waited += 5
-
-            try {
-                $response = Invoke-WebRequest -Uri "http://localhost:8000/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
-                $health = $response.Content | ConvertFrom-Json
-
-                # Check if service is healthy AND models are loaded
-                if ($health.status -eq "healthy" -and $health.text_model_loaded -eq $true -and $health.vision_model_loaded -eq $true) {
-                    $healthy = $true
-                    break
-                }
-            }
-            catch {
-                Write-Host "." -NoNewline -ForegroundColor Gray
-            }
-        }
-
-        Write-Host ""
-
-        if ($healthy) {
-            Write-Host "  vLLM service started successfully - Models loaded:" -ForegroundColor Green
-            Write-Host "    Text Model:   Qwen2.5-7B-Instruct (GPU)" -ForegroundColor Gray
-            Write-Host "    Vision Model: Qwen2-VL-7B-Instruct (GPU)" -ForegroundColor Gray
-            Write-Host "    GPU Count:    $($health.gpu_count)" -ForegroundColor Gray
-        }
-        else {
-            Write-Host "  WARNING: vLLM not responding after $maxWait seconds" -ForegroundColor Yellow
-            Write-Host "  Press Enter to continue or CTRL+C to abort..." -ForegroundColor Yellow
-            Read-Host
+        if (-not $vllmRunning) {
+            Write-Host ""
         }
     }
 
@@ -175,11 +220,17 @@ Write-Host "[2/4] Checking Docker..." -ForegroundColor Yellow
 Write-Host "------------------------------" -ForegroundColor DarkGray
 
 try {
-    $dockerVersion = docker --version
-    Write-Host "  Docker found: $dockerVersion" -ForegroundColor Green
+    $dockerServerVersion = docker info --format '{{.ServerVersion}}'
+
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($dockerServerVersion)) {
+        throw "Docker daemon not reachable"
+    }
+
+    $dockerServerVersion = $dockerServerVersion.Trim()
+    Write-Host "  Docker daemon reachable (Server version: $dockerServerVersion)" -ForegroundColor Green
 }
 catch {
-    Write-Host "  ERROR: Docker not running" -ForegroundColor Red
+    Write-Host "  ERROR: Docker daemon not running or unreachable" -ForegroundColor Red
     exit 1
 }
 

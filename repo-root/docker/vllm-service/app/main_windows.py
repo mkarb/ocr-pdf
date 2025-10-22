@@ -19,6 +19,7 @@ import os
 import logging
 import base64
 import json
+import asyncio
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from io import BytesIO
@@ -343,4 +344,9 @@ Where bbox coordinates are percentages (0-100) of image width/height."""
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    except KeyboardInterrupt:
+        logger.info("Shutdown signal received. Exiting gracefully.")
+    except asyncio.CancelledError:
+        logger.info("Async tasks cancelled during shutdown. Exiting gracefully.")
