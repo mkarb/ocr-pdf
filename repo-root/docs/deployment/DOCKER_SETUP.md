@@ -178,23 +178,22 @@ streamlit run ui/streamlit_app.py
 docker-compose -f docker-compose-postgres.yml up -d
 ```
 
-### Migration from SQLite to PostgreSQL
+### Migrating Data (PostgreSQL-only)
 
 ```python
-# Migration script
-from pdf_compare.store import open_db as open_sqlite
 from pdf_compare.db_backend import create_backend
-from pdf_compare.models import VectorMap
+from pdf_compare.pdf_extract import pdf_to_vectormap
 
-# Open SQLite
-sqlite_conn = open_sqlite("vectormap.sqlite")
+DATABASE_URL = "postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare"
+pg_backend = create_backend(DATABASE_URL)
 
-# Open PostgreSQL
-pg_backend = create_backend("postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare")
-
-# Migrate documents
-# (Implementation depends on your specific needs)
+# Example: re-ingest PDFs directly into PostgreSQL
+for pdf_path in ["old.pdf", "new.pdf"]:
+    vectormap = pdf_to_vectormap(pdf_path, enable_ocr=True)
+    pg_backend.upsert_vectormap(vectormap)
 ```
+
+> ℹ️ Legacy SQLite databases should be exported to JSON/CSV and re-imported using the PostgreSQL APIs above.
 
 ### Network Configuration
 

@@ -53,6 +53,10 @@ class OCRVisualizer:
         self.stage_counter = 0
         self.page_number = 1
 
+        # Create output directory if it doesn't exist
+        if self.config.enabled:
+            self.config.output_dir.mkdir(parents=True, exist_ok=True)
+
     def reset(self, page_number: int):
         """Reset counter for new page."""
         self.stage_counter = 0
@@ -82,8 +86,16 @@ class OCRVisualizer:
         cv2.putText(img_with_info, text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        cv2.imwrite(str(output_path), img_with_info)
-        print(f"[DEBUG] Saved: {output_path}")
+        try:
+            # Ensure parent directory exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            success = cv2.imwrite(str(output_path), img_with_info)
+            if success:
+                print(f"[OCR DEBUG] Saved: {output_path}", flush=True)
+            else:
+                print(f"[OCR DEBUG] Failed to save: {output_path}", flush=True)
+        except Exception as e:
+            print(f"[OCR DEBUG] Error saving {output_path}: {e}", flush=True)
 
     def save_grayscale(self, gray: np.ndarray):
         """Stage 2: Save grayscale conversion."""
@@ -419,10 +431,13 @@ Low Confidence Texts (< {self.config.confidence_threshold_low}%):
             report += f"  ... and {len(low_conf_items) - 20} more\n"
 
         # Save report
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(report)
-
-        print(f"[DEBUG] Saved: {output_path}")
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(report)
+            print(f"[OCR DEBUG] Saved: {output_path}", flush=True)
+        except Exception as e:
+            print(f"[OCR DEBUG] Error saving {output_path}: {e}", flush=True)
 
 
 # Convenience function for integration

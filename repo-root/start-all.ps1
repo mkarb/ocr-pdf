@@ -99,7 +99,7 @@ function Start-VllmService {
         $waited += 5
 
         try {
-            $response = Invoke-WebRequest -Uri "http://localhost:8000/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri "http://localhost:8001/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
             $health = $response.Content | ConvertFrom-Json
 
             if ($health.status -eq "healthy" -and $health.text_model_loaded -eq $true -and $health.vision_model_loaded -eq $true) {
@@ -157,7 +157,7 @@ if (-not $SkipVLLM) {
     $env:VLLM_TEXT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
     $env:VLLM_VISION_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
     $env:ENABLE_VISION_OCR = "true"
-    $env:PORT = "8000"
+    $env:PORT = "8001"
 
     Write-Host "  Configuration loaded" -ForegroundColor Gray
 
@@ -166,7 +166,7 @@ if (-not $SkipVLLM) {
     $startVllm = $false
     $restartExisting = $false
     try {
-        $response = Invoke-WebRequest -Uri "http://localhost:8000/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        $response = Invoke-WebRequest -Uri "http://localhost:8001/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
         $health = $response.Content | ConvertFrom-Json
 
         # Verify models are loaded
@@ -207,7 +207,7 @@ if (-not $SkipVLLM) {
 
 if ($VLLMOnly) {
     Write-Host "vLLM service is running." -ForegroundColor Green
-    Write-Host "Access at: http://localhost:8000" -ForegroundColor Cyan
+    Write-Host "Access at: http://localhost:8001" -ForegroundColor Cyan
     Write-Host ""
     exit 0
 }
@@ -313,7 +313,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Services:" -ForegroundColor White
 Write-Host "  UI:        http://localhost" -ForegroundColor Cyan
-Write-Host "  vLLM API:  http://localhost:8000" -ForegroundColor Cyan
+Write-Host "  vLLM API:  http://localhost:8001" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "To stop: .\stop-all.ps1" -ForegroundColor Yellow
 Write-Host ""

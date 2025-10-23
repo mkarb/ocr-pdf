@@ -8,6 +8,11 @@ and displays visual debug output.
 import streamlit as st
 from pathlib import Path
 import json
+from PIL import Image
+
+# Increase PIL decompression bomb limit for large debug images
+# Debug images can be very large (e.g., 1200 DPI renders)
+Image.MAX_IMAGE_PIXELS = 500_000_000  # 500 megapixels
 
 st.set_page_config(page_title="OCR Confidence", page_icon="search", layout="wide")
 
@@ -179,8 +184,11 @@ with col1:
 with col2:
     st.subheader("Debug Output")
 
-    # Check for debug images
-    debug_dir = Path("./debug/ocr")
+    # Get debug directory from session state, fallback to default
+    debug_config = st.session_state.get("ocr_debug_config", {})
+    debug_dir_str = debug_config.get("output_dir", "./debug/ocr")
+    debug_dir = Path(debug_dir_str)
+
     if debug_dir.exists():
         page_prefix = f"page_{selected_page:03d}_"
         debug_images = sorted([
@@ -189,6 +197,12 @@ with col2:
 
         if debug_images:
             st.success(f"Found {len(debug_images)} debug images")
+
+            # Show available stages
+            with st.expander("Available Debug Stages", expanded=False):
+                for img in debug_images:
+                    stage_name = img.name.split('_', 3)[-1].replace('.png', '').replace('_', ' ').title()
+                    st.write(f"- {stage_name}")
 
             # Image selector
             image_names = {
@@ -203,7 +217,15 @@ with col2:
 
             if selected_image_name:
                 image_path = image_names[selected_image_name]
-                st.image(image_path, caption=selected_image_name, use_column_width=True)
+
+                # Show file info without displaying (images can be very large)
+                try:
+                    img = Image.open(image_path)
+                    width, height = img.size
+                    file_size = Path(image_path).stat().st_size / (1024 * 1024)  # MB
+                    st.info(f"**{selected_image_name}**\n\nDimensions: {width} x {height} px\n\nFile size: {file_size:.2f} MB")
+                except Exception as e:
+                    st.info(f"**{selected_image_name}**\n\n{Path(image_path).name}")
 
                 # Download button for selected image
                 with open(image_path, "rb") as file:
@@ -211,31 +233,41 @@ with col2:
                         label="Download This Image",
                         data=file,
                         file_name=Path(image_path).name,
-                        mime="image/png"
+                        mime="image/png",
+                        use_container_width=True
                     )
 
             # Download all debug images for this page
             st.divider()
-            if st.button("Download All Debug Images (ZIP)"):
-                import zipfile
-                import io
+            st.write("**Download All Debug Files**")
 
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    for img_path in debug_images:
-                        zip_file.write(img_path, img_path.name)
+            import zipfile
+            import io
 
-                    # Include summary if exists
-                    summary_path = debug_dir / f"{page_prefix}08_summary.txt"
-                    if summary_path.exists():
-                        zip_file.write(summary_path, summary_path.name)
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                # Add all PNG images
+                for img_path in debug_images:
+                    zip_file.write(img_path, img_path.name)
 
-                st.download_button(
-                    label="Download ZIP",
-                    data=zip_buffer.getvalue(),
-                    file_name=f"debug_page_{selected_page}.zip",
-                    mime="application/zip"
-                )
+                # Include all TXT files for this page (summary, low confidence, etc.)
+                debug_txt_files = sorted([
+                    f for f in debug_dir.glob(f"{page_prefix}*.txt")
+                ])
+                for txt_path in debug_txt_files:
+                    zip_file.write(txt_path, txt_path.name)
+
+            # Count files
+            debug_txt_files = sorted([f for f in debug_dir.glob(f"{page_prefix}*.txt")])
+            total_files = len(debug_images) + len(debug_txt_files)
+
+            st.download_button(
+                label=f"Download All ({total_files} files: {len(debug_images)} images + {len(debug_txt_files)} reports)",
+                data=zip_buffer.getvalue(),
+                file_name=f"debug_page_{selected_page}.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
 
             # Show summary report if exists
             summary_path = debug_dir / f"{page_prefix}08_summary.txt"
@@ -245,10 +277,21 @@ with col2:
                         st.text(f.read())
         else:
             st.info(f"No debug images found for page {selected_page}.")
-            st.caption("Enable 'OCR Debug Mode' in the main page to generate debug output.")
+            st.caption(f"Looking in: `{debug_dir.absolute()}`")
+            st.caption("Enable 'OCR Debug Mode' in the main page before ingesting a PDF to generate debug output.")
     else:
-        st.info("Debug output directory not found.")
-        st.caption("Enable 'OCR Debug Mode' in the main page to generate debug output.")
+        st.info(f"Debug output directory not found: `{debug_dir.absolute()}`")
+        with st.expander("Troubleshooting"):
+            import os
+            st.write("**Current working directory:**")
+            st.code(os.getcwd())
+            st.write("**Expected debug directory:**")
+            st.code(str(debug_dir.absolute()))
+            st.write("**Steps to generate debug output:**")
+            st.write("1. Go to the main page (Ingest)")
+            st.write("2. Enable 'OCR Debug Mode' in the sidebar")
+            st.write("3. Upload and process a PDF with OCR enabled")
+            st.write("4. Debug images will be saved to the directory above")
 
 # Download options
 st.divider()

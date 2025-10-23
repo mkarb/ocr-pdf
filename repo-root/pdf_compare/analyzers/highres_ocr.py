@@ -57,7 +57,7 @@ BBox = Tuple[float, float, float, float]  # x0,y0,x1,y1 in PDF user space
 class HighResOCRConfig:
     dpi: int = 500            # 500–600 for fine diagrams
     psm: int = 11             # sparse text, as lines (Tesseract only)
-    min_conf: int = 60        # filter weak OCR results
+    min_conf: int = 50        # filter weak OCR results
     lang: str = "eng"
     engine: str = "tesseract" # OCR engine: "tesseract", "easyocr", or "qwen-vl"
     use_gpu: bool = True      # Use GPU if available (EasyOCR, Qwen-VL)
@@ -206,7 +206,8 @@ def _ocr_tile_easyocr(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
         out.append({
             "text": text,
             "bbox": (float(x0), float(y0), float(x1), float(y1)),
-            "conf": conf_pct
+            "conf": conf_pct,
+            "source": "ocr-easyocr"
         })
 
     return out
@@ -247,7 +248,12 @@ def _ocr_tile_tesseract(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
         if not txt or conf < cfg.min_conf:
             continue
         x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-        out.append({"text": txt, "bbox": (float(x), float(y), float(x+w), float(y+h)), "conf": conf})
+        out.append({
+            "text": txt,
+            "bbox": (float(x), float(y), float(x+w), float(y+h)),
+            "conf": conf,
+            "source": "ocr-tesseract"
+        })
     return out
 
 
@@ -292,7 +298,8 @@ def _ocr_tile_qwen_vl(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
         out.append({
             "text": item["text"],
             "bbox": item["bbox"],
-            "conf": conf
+            "conf": conf,
+            "source": "ocr-qwen-vl"
         })
 
     return out
@@ -395,13 +402,23 @@ def highres_ocr(
                 # map tile-pixel bbox back to PDF coords
                 X0, Y0 = (px0 + tx0) / zoom, (py0 + ty0) / zoom
                 X1, Y1 = (px0 + tx1) / zoom, (py0 + ty1) / zoom
-                results.append({"text": s["text"], "bbox": (X0, Y0, X1, Y1), "conf": s.get("conf", 0)})
+                results.append({
+                    "text": s["text"],
+                    "bbox": (X0, Y0, X1, Y1),
+                    "conf": s.get("conf", 0),
+                    "source": s.get("source", "ocr")
+                })
     else:
         # Otherwise OCR the whole page
         spans = _ocr_tile(gray, cfg)
         for s in spans:
             x0, y0, x1, y1 = s["bbox"]
-            results.append({"text": s["text"], "bbox": (x0/zoom, y0/zoom, x1/zoom, y1/zoom), "conf": s.get("conf", 0)})
+            results.append({
+                "text": s["text"],
+                "bbox": (x0/zoom, y0/zoom, x1/zoom, y1/zoom),
+                "conf": s.get("conf", 0),
+                "source": s.get("source", "ocr")
+            })
 
     # STAGE 4: Save detections with confidence overlay
     if debug_visualizer:
@@ -439,7 +456,7 @@ def calculate_tile_grid(
     page_width: float,
     page_height: float,
     dpi: int,
-    max_tile_pixels: int = 29000,
+    max_tile_pixels: int = 29000,  # Default for Tesseract/EasyOCR (override to 4096 for Qwen-VL)
     overlap_pct: float = 0.20
 ) -> TileConfig:
     """
@@ -667,9 +684,13 @@ def process_single_tile(
     # Render tile
     tile_img = render_tile(pdf_path, page_index, tile_bounds, zoom)
 
-    # Check if tile has content
-    if skip_empty and not detect_tile_content(tile_img, white_threshold, min_content_pct):
-        return []
+    # Track whether the tile contains content when skip_empty=True
+    tile_bounds.has_content = True
+    if skip_empty:
+        has_content = detect_tile_content(tile_img, white_threshold, min_content_pct)
+        tile_bounds.has_content = has_content
+        if not has_content:
+            return []
 
     # Run OCR on tile
     tile_results = _ocr_tile(tile_img, ocr_config)
@@ -791,7 +812,8 @@ def tiled_ocr(
     return_report: bool = False,
     use_dual_psm: bool = True,  # Try both PSM 11 and PSM 6 (Tesseract only)
     engine: str = "tesseract",  # OCR engine: "tesseract" or "easyocr"
-    use_gpu: bool = True        # Use GPU if available (EasyOCR only)
+    use_gpu: bool = True,       # Use GPU if available (EasyOCR only)
+    debug_visualizer: Optional['OCRVisualizer'] = None  # Optional debug visualizer
 ) -> List[Dict[str, Any]] | Tuple[List[Dict[str, Any]], TileOCRReport]:
     """
     Perform tiled OCR on a large PDF page.
@@ -818,6 +840,13 @@ def tiled_ocr(
     """
     start_time = time.time()
 
+    # Initialize debug visualizer if not provided
+    if debug_visualizer is None and HAVE_VISUALIZER:
+        debug_visualizer = create_visualizer(enabled=False)
+
+    if debug_visualizer:
+        debug_visualizer.reset(page_index + 1)
+
     # Get page dimensions
     doc = fitz.open(pdf_path)
     page = doc[page_index]
@@ -825,8 +854,19 @@ def tiled_ocr(
     page_height = page.rect.height
     doc.close()
 
+    # Engine-specific tile size limits
+    # Qwen-VL (vision model): Small tiles (4K) to avoid decompression bomb errors
+    # EasyOCR/Tesseract: Use Tesseract's limit (29K) - they benefit from high DPI
+    if engine == "qwen-vl":
+        max_tile_pixels = 4096
+        import sys
+        print(f"OCR: Using Qwen-VL with 4K tile limit (vision model)", file=sys.stderr)
+    else:
+        # EasyOCR and Tesseract both benefit from high DPI and can handle large tiles
+        max_tile_pixels = 29000  # Tesseract's original limit - works well for both
+
     # Calculate tile grid
-    config = calculate_tile_grid(page_width, page_height, dpi, overlap_pct=overlap_pct)
+    config = calculate_tile_grid(page_width, page_height, dpi, max_tile_pixels=max_tile_pixels, overlap_pct=overlap_pct)
 
     # Generate tile bounds
     zoom = dpi / 72.0
@@ -845,7 +885,6 @@ def tiled_ocr(
 
     # Process tiles (serial for now, parallel support can be added later)
     all_results: List[Dict[str, Any]] = []
-    tiles_skipped = 0
 
     if config.rows > 1 or config.cols > 1:
         print(f"OCR: Tiling page into {config.rows}x{config.cols} grid with {overlap_pct*100:.0f}% overlap", file=sys.stderr)
@@ -858,7 +897,7 @@ def tiled_ocr(
 
     # Process each tile with all PSM modes (Tesseract) or single pass (EasyOCR)
     for tile in tiles:
-        tile_all_results = []
+        tile_all_results: List[Dict[str, Any]] = []
 
         if engine == "easyocr":
             # EasyOCR doesn't have PSM modes, just run once
@@ -881,6 +920,10 @@ def tiled_ocr(
                 min_content_pct=min_content_pct,
                 white_threshold=config.white_threshold
             )
+
+            # If tile was deemed empty, skip further processing
+            if skip_empty and not getattr(tile, "has_content", True):
+                continue
 
             tile_all_results.extend(tile_results)
         else:
@@ -906,12 +949,25 @@ def tiled_ocr(
                     white_threshold=config.white_threshold
                 )
 
+                # Once a tile is classified as empty we can stop trying additional PSMs
+                if skip_empty and not getattr(tile, "has_content", True):
+                    tile_all_results = []
+                    break
+
                 tile_all_results.extend(tile_results)
 
-        if not tile_all_results and skip_empty:
-            tiles_skipped += 1
-        else:
-            all_results.extend(tile_all_results)
+        # Skip aggregation entirely for empty tiles when skip_empty=True
+        if skip_empty and not getattr(tile, "has_content", True):
+            continue
+
+        all_results.extend(tile_all_results)
+
+    tile_processed_flags = [
+        (not skip_empty) or getattr(tile, "has_content", True)
+        for tile in tiles
+    ]
+    tiles_skipped = tile_processed_flags.count(False)
+    tiles_processed_count = len(tiles) - tiles_skipped
 
     # Deduplicate results from overlapping tiles
     initial_count = len(all_results)
@@ -923,7 +979,7 @@ def tiled_ocr(
     # Create report
     report = TileOCRReport(
         total_tiles=len(tiles),
-        tiles_processed=len(tiles) - tiles_skipped,
+        tiles_processed=tiles_processed_count,
         tiles_skipped_empty=tiles_skipped,
         total_results=len(deduplicated_results),
         duplicates_removed=duplicates_removed,
@@ -932,6 +988,48 @@ def tiled_ocr(
         dpi_used=dpi,
         overlap_pct=overlap_pct
     )
+
+    # Generate debug output if visualizer is enabled
+    if debug_visualizer and debug_visualizer.config.enabled:
+        # Render full page at lower DPI for debug visualization (to keep file sizes reasonable)
+        DEBUG_DPI = 150  # Much lower than OCR DPI, but sufficient for visualization
+        gray_full, zoom_full = _render_page_gray(pdf_path, page_index, DEBUG_DPI)
+
+        # Convert results to pixel coordinates for visualization
+        results_px = []
+        for r in deduplicated_results:
+            pdf_bbox = r["bbox"]
+            px_bbox = [v * zoom_full for v in pdf_bbox]
+            results_px.append({
+                "text": r["text"],
+                "bbox": px_bbox,
+                "conf": r.get("conf", 0)
+            })
+
+        # Save debug stages
+        debug_visualizer.save_original(gray_full, DEBUG_DPI)
+        debug_visualizer.save_grayscale(gray_full)
+
+        # Save tile grid visualization
+        tile_viz_data = [
+            {
+                "px0": t.px0,
+                "py0": t.py0,
+                "px1": t.px1,
+                "py1": t.py1,
+                "tile_id": t.tile_id,
+                "has_content": getattr(t, "has_content", True)
+            }
+            for t in tiles
+        ]
+        processed_mask = np.array(tile_processed_flags, dtype=bool)
+        debug_visualizer.save_tiles(gray_full, tile_viz_data, processed_mask)
+
+        # Save detection results
+        debug_visualizer.save_detections(gray_full, results_px)
+        debug_visualizer.save_final_with_text(gray_full, results_px)
+        debug_visualizer.save_confidence_heatmap(gray_full.shape[1], gray_full.shape[0], results_px)
+        debug_visualizer.generate_summary_report(deduplicated_results, processing_time)
 
     if return_report:
         return deduplicated_results, report

@@ -3,7 +3,7 @@ Document comparison with SQLAlchemy backend support.
 """
 
 from __future__ import annotations
-from typing import List, Tuple, Dict, Union
+from typing import List, Tuple, Dict
 import json
 import numpy as np
 from shapely.wkb import loads as wkb_loads
@@ -71,7 +71,7 @@ def _geom_matches(gb: BaseGeometry, candidates: List[BaseGeometry]) -> bool:
 
 
 def diff_documents(
-    conn_or_backend: Union[DatabaseBackend, any],
+    backend: DatabaseBackend,
     old_id: str,
     new_id: str,
     pages: List[int] | None = None
@@ -80,54 +80,52 @@ def diff_documents(
     Compare two ingested documents page by page (vector + text).
     Returns a list of per-page diff dicts compatible with overlay.py.
     """
-    if isinstance(conn_or_backend, DatabaseBackend):
-        backend = conn_or_backend
+    if not isinstance(backend, DatabaseBackend):
+        raise TypeError(
+            "diff_documents now requires a DatabaseBackend. "
+            "Legacy sqlite3 connections are no longer supported."
+        )
 
-        # Get page counts from backend
-        with backend.SessionLocal() as session:
-            from .db_models import Document
-            old_doc = session.get(Document, old_id)
-            new_doc = session.get(Document, new_id)
+    # Get page counts from backend
+    with backend.SessionLocal() as session:
+        from .db_models import Document
+        old_doc = session.get(Document, old_id)
+        new_doc = session.get(Document, new_id)
 
-            if not old_doc or not new_doc:
-                raise ValueError("Unknown doc_id(s) supplied to diff_documents")
+        if not old_doc or not new_doc:
+            raise ValueError("Unknown doc_id(s) supplied to diff_documents")
 
-            pc_old, pc_new = old_doc.page_count, new_doc.page_count
+        pc_old, pc_new = old_doc.page_count, new_doc.page_count
 
-        max_pages = min(pc_old, pc_new)
-        if pages is None:
-            pages = list(range(1, max_pages + 1))
-        return [diff_pages(backend, old_id, new_id, p) for p in pages]
-    else:
-        # Legacy sqlite3 connection
-        from .compare import diff_documents as legacy_diff
-        return legacy_diff(conn_or_backend, old_id, new_id, pages)
+    max_pages = min(pc_old, pc_new)
+    if pages is None:
+        pages = list(range(1, max_pages + 1))
+    return [diff_pages(backend, old_id, new_id, p) for p in pages]
 
 
 def diff_pages(
-    conn_or_backend: Union[DatabaseBackend, any],
+    backend: DatabaseBackend,
     old_id: str,
     new_id: str,
     page: int
 ) -> Dict:
     """Compare a single page between two documents."""
 
-    if isinstance(conn_or_backend, DatabaseBackend):
-        backend = conn_or_backend
+    if not isinstance(backend, DatabaseBackend):
+        raise TypeError(
+            "diff_pages now requires a DatabaseBackend. "
+            "Legacy sqlite3 connections are no longer supported."
+        )
 
-        # Load geometries
-        a_geom_wkbs = backend.load_page_geoms(old_id, page)
-        b_geom_wkbs = backend.load_page_geoms(new_id, page)
-        a_geoms = [wkb_loads(wkb) for wkb in a_geom_wkbs]
-        b_geoms = [wkb_loads(wkb) for wkb in b_geom_wkbs]
+    # Load geometries
+    a_geom_wkbs = backend.load_page_geoms(old_id, page)
+    b_geom_wkbs = backend.load_page_geoms(new_id, page)
+    a_geoms = [wkb_loads(wkb) for wkb in a_geom_wkbs]
+    b_geoms = [wkb_loads(wkb) for wkb in b_geom_wkbs]
 
-        # Load text
-        a_txt = backend.load_page_texts(old_id, page)
-        b_txt = backend.load_page_texts(new_id, page)
-    else:
-        # Legacy path
-        from .compare import diff_pages as legacy_diff_page
-        return legacy_diff_page(conn_or_backend, old_id, new_id, page)
+    # Load text
+    a_txt = backend.load_page_texts(old_id, page)
+    b_txt = backend.load_page_texts(new_id, page)
 
     # Early no-op
     if not a_geoms and not b_geoms and not a_txt and not b_txt:

@@ -133,13 +133,28 @@ def _drawings_to_geoms(
     return out
 
 
-def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index: Optional[int] = None, enable_ocr: bool = False, ocr_dpi: int = 400, ocr_engine: str = "easyocr") -> List[Dict[str, Any]]:
+def _extract_text(
+    page: "fitz.Page",
+    pdf_path: Optional[str] = None,
+    page_index: Optional[int] = None,
+    enable_ocr: bool = False,
+    ocr_dpi: int = 400,
+    ocr_engine: str = "easyocr",
+    debug_ocr: bool = False,
+    debug_output_dir: Optional[str] = None,
+    debug_conf_low: int = 70,
+    debug_conf_high: int = 90,
+) -> List[Dict[str, Any]]:
     """
     Extract native text spans as plain dicts: {"text": str, "bbox": (x0,y0,x1,y1), "font": str|None, "size": float|None}
     Optionally runs OCR if enable_ocr=True and minimal native text is found.
 
     Args:
         ocr_engine: OCR engine to use - "tesseract", "easyocr", or "qwen-vl"
+        debug_ocr: if True, outputs visual debugging images
+        debug_output_dir: directory to save debug images
+        debug_conf_low: low confidence threshold for visualization
+        debug_conf_high: high confidence threshold for visualization
     """
     runs: List[Dict[str, Any]] = []
     raw = page.get_text("dict") or {}
@@ -163,6 +178,27 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
     if enable_ocr and len(runs) < 20 and pdf_path and page_index is not None:
         try:
             from .analyzers import highres_ocr, tiled_ocr, HighResOCRConfig
+
+            # Create debug visualizer if requested
+            debug_visualizer = None
+            if debug_ocr:
+                try:
+                    from .debug import create_visualizer
+                    debug_output_dir_final = debug_output_dir or "./debug/ocr"
+                    debug_visualizer = create_visualizer(
+                        enabled=True,
+                        output_dir=debug_output_dir_final,
+                        conf_low=debug_conf_low,
+                        conf_high=debug_conf_high,
+                    )
+                    import sys
+                    print(f"[OCR DEBUG] Created visualizer with output_dir={debug_output_dir_final}, enabled=True", file=sys.stderr, flush=True)
+                except ImportError as e:
+                    import sys
+                    print(f"Warning: OCR debug mode requested but debug module not available: {e}", file=sys.stderr, flush=True)
+                except Exception as e:
+                    import sys
+                    print(f"Warning: Failed to create debug visualizer: {e}", file=sys.stderr, flush=True)
 
             # Get page dimensions
             page_width = page.rect.width
@@ -194,8 +230,9 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
                     max_workers=1,  # Serial in Streamlit
                     return_report=True,
                     use_dual_psm=True,  # Use both PSM 11 and PSM 6 for better text capture (Tesseract only)
-                    engine="easyocr",   # Use EasyOCR for better accuracy on small text
-                    use_gpu=True        # Enable GPU acceleration
+                    engine=ocr_engine,  # Use user-selected OCR engine
+                    use_gpu=True,       # Enable GPU acceleration
+                    debug_visualizer=debug_visualizer  # Pass debug visualizer
                 )
 
                 print(f"OCR: page {page_index+1}: Tiled OCR complete - {report.tiles_processed}/{report.total_tiles} tiles processed, {report.tiles_skipped_empty} skipped, {len(ocr_results)} text items, {report.duplicates_removed} duplicates removed", file=sys.stderr)
@@ -205,7 +242,7 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
                 print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using whole-page OCR at {dpi} DPI", file=sys.stderr)
 
                 config = HighResOCRConfig(dpi=dpi, psm=11, min_conf=50, engine=ocr_engine, use_gpu=True)
-                ocr_results = highres_ocr(pdf_path, page_index, config)
+                ocr_results = highres_ocr(pdf_path, page_index, config, debug_visualizer=debug_visualizer)
 
                 print(f"OCR: page {page_index+1}: Extracted {len(ocr_results)} text items", file=sys.stderr)
 
@@ -222,7 +259,7 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
                     "bbox": ocr_text.get("bbox", (0, 0, 0, 0)),
                     "font": None,
                     "size": None,
-                    "source": "ocr",
+                    "source": ocr_text.get("source", "ocr"),  # Preserve OCR engine name
                     "confidence": confidence  # Preserve OCR confidence (0-100)
                 })
 
@@ -248,6 +285,10 @@ def _extract_page_job(
     enable_ocr: bool = False,
     ocr_dpi: int = 400,
     ocr_engine: str = "easyocr",
+    debug_ocr: bool = False,
+    debug_output_dir: Optional[str] = None,
+    debug_conf_low: int = 70,
+    debug_conf_high: int = 90,
 ) -> Dict[str, Any]:
     """
     Isolated worker: Extract one page → return pure Python dict.
@@ -265,7 +306,18 @@ def _extract_page_job(
         bezier_samples=bezier_samples,
         simplify_tolerance=simplify_tolerance,
     )
-    texts = _extract_text(pg, pdf_path=pdf_path, page_index=page_index, enable_ocr=enable_ocr, ocr_dpi=ocr_dpi, ocr_engine=ocr_engine)
+    texts = _extract_text(
+        pg,
+        pdf_path=pdf_path,
+        page_index=page_index,
+        enable_ocr=enable_ocr,
+        ocr_dpi=ocr_dpi,
+        ocr_engine=ocr_engine,
+        debug_ocr=debug_ocr,
+        debug_output_dir=debug_output_dir,
+        debug_conf_low=debug_conf_low,
+        debug_conf_high=debug_conf_high,
+    )
 
     out = {
         "page_number": page_index + 1,
@@ -294,6 +346,10 @@ def pdf_to_vectormap(
     enable_ocr: bool = False,                 # Enable OCR for engineering drawings
     ocr_dpi: int = 400,                       # User-requested DPI for OCR (will be auto-capped)
     ocr_engine: str = "easyocr",              # OCR engine: "tesseract", "easyocr", or "qwen-vl"
+    debug_ocr: bool = False,                  # Enable OCR visual debugging
+    debug_output_dir: Optional[str] = None,   # Output directory for debug images
+    debug_conf_low: int = 70,                 # Low confidence threshold for visualization
+    debug_conf_high: int = 90,                # High confidence threshold for visualization
 ) -> VectorMap:
     """
     Parallel, high-throughput ingest.
@@ -304,6 +360,10 @@ def pdf_to_vectormap(
     - simplify_tolerance: if set, simplifies strokes to reduce oversampled paths
     - enable_ocr: if True, runs OCR on pages with minimal native text
     - ocr_engine: OCR engine to use - "tesseract", "easyocr", or "qwen-vl"
+    - debug_ocr: if True, outputs visual debugging images at each OCR stage
+    - debug_output_dir: directory to save debug images (default: ./debug/ocr)
+    - debug_conf_low: low confidence threshold for visualization (default: 70)
+    - debug_conf_high: high confidence threshold for visualization (default: 90)
     """
     p = Path(path)
     if not p.exists():
@@ -361,6 +421,11 @@ def pdf_to_vectormap(
                     simplify_tolerance=simplify_tolerance,
                     enable_ocr=enable_ocr,
                     ocr_dpi=ocr_dpi,
+                    ocr_engine=ocr_engine,
+                    debug_ocr=debug_ocr,
+                    debug_output_dir=debug_output_dir,
+                    debug_conf_low=debug_conf_low,
+                    debug_conf_high=debug_conf_high,
                 )
             )
     else:
@@ -378,6 +443,10 @@ def pdf_to_vectormap(
                     enable_ocr,
                     ocr_dpi,
                     ocr_engine,
+                    debug_ocr,
+                    debug_output_dir,
+                    debug_conf_low,
+                    debug_conf_high,
                 )
 
             page_dicts = pool.submit_throttled(

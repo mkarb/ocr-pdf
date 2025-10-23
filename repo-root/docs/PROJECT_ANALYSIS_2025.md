@@ -33,8 +33,8 @@ The project successfully migrated from SQLite to PostgreSQL-only architecture (J
 
 **Recommendations:**
 ```python
-# Clean up legacy files
-rm pdf_compare/store.py pdf_compare/search.py pdf_compare/compare.py
+# Legacy cleanup (completed Jan 2025)
+# store_new/search_new/compare_new are now authoritative
 
 # Consider feature flags for server mode instead of separate files
 if SERVER_MODE:
@@ -562,9 +562,9 @@ services:
   git grep -l "from.*\.store import" "from.*\.search import" "from.*\.compare import"
 
   # Remove old files
-  git rm pdf_compare/store.py
-  git rm pdf_compare/search.py
-  git rm pdf_compare/compare.py
+# (completed) Removed pdf_compare/store.py
+# (completed) Removed pdf_compare/search.py
+# (completed) Removed pdf_compare/compare.py
 
   # Update any stale documentation references
   grep -r "store.py" docs/

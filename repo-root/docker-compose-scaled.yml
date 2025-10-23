@@ -145,14 +145,14 @@ services:
   # vLLM SERVICE - RUNNING ON WINDOWS HOST (NOT IN DOCKER)
   # ========================================================================
   # The vLLM service runs natively on Windows with AMD ROCm GPUs.
-  # It is accessible at: http://host.docker.internal:8000
+  # It is accessible at: http://host.docker.internal:8001
   #
   # To start the service on Windows:
   #   1. cd H:\repo-root\ocr-pdf\repo-root
   #   2. .\venv-vllm-py312\Scripts\activate
   #   3. cd docker\vllm-service\app
   #   4. Set environment variables (see .env for HF_TOKEN)
-  #   5. python main_windows.py
+  #   5. python main_windows.py --port 8001
   #
   # NOTE: The vllm-service container is COMMENTED OUT because the service
   # runs on the Windows host instead of in Docker (AMD ROCm not supported in Docker Desktop)
@@ -186,7 +186,7 @@ services:
       OLLAMA_HOST: http://ollama:11434
 
       # vLLM Service (GPU-accelerated inference) - Running on Windows host
-      VLLM_HOST: http://host.docker.internal:8000
+      VLLM_HOST: http://host.docker.internal:8001
       VLLM_ENABLED: "true"
 
       # Performance settings

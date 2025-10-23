@@ -9,9 +9,9 @@ Usage
      __init__.py
      models.py
      pdf_extract.py
-     store.py
-     search.py
-     compare.py
+     store_new.py
+     search_new.py
+     compare_new.py
      overlay.py
    ui/
      streamlit_app.py  (this file)
@@ -314,6 +314,64 @@ with workspace_tab:
                 help="Higher DPI captures smaller text. Auto-tiles large pages.",
                 disabled=not enable_ocr
             )
+
+            # Show tile size calculator if OCR enabled and file is uploaded
+            if enable_ocr and uploaded:
+                import math
+                import fitz
+
+                # Get first page dimensions
+                try:
+                    temp_path = uploads_dir / uploaded.name
+                    if temp_path.exists():
+                        doc = fitz.open(str(temp_path))
+                        page = doc[0]
+                        page_width = page.rect.width
+                        page_height = page.rect.height
+                        doc.close()
+
+                        # Calculate pixel dimensions at selected DPI
+                        zoom = ocr_dpi / 72.0
+                        pixel_width = int(page_width * zoom)
+                        pixel_height = int(page_height * zoom)
+
+                        # Engine-specific tile size limits
+                        if "Qwen-VL" in ocr_engine:
+                            MAX_TILE_PIXELS = 4096  # Vision model - keep small
+                        else:
+                            MAX_TILE_PIXELS = 29000  # EasyOCR/Tesseract - both benefit from high DPI
+
+                        TESSERACT_LIMIT = 29000
+                        needs_tiling = (pixel_width > TESSERACT_LIMIT or pixel_height > TESSERACT_LIMIT)
+
+                        if needs_tiling:
+                            # Calculate tile grid
+                            effective_max = MAX_TILE_PIXELS / (1 + 0.35)  # 35% overlap
+                            cols = math.ceil(pixel_width / effective_max)
+                            rows = math.ceil(pixel_height / effective_max)
+                            total_tiles = rows * cols
+
+                            # Calculate actual tile size
+                            tile_width = pixel_width // cols
+                            tile_height = pixel_height // rows
+                            tile_megapixels = (tile_width * tile_height) / 1_000_000
+
+                            # Show warning if tiles are too large
+                            if tile_width > MAX_TILE_PIXELS or tile_height > MAX_TILE_PIXELS:
+                                st.warning(f"Tile size: {tile_width}x{tile_height}px ({tile_megapixels:.1f}MP) - Exceeds {MAX_TILE_PIXELS}px limit!")
+                                st.caption(f"Grid: {rows}x{cols} = {total_tiles} tiles")
+                                if "Qwen-VL" in ocr_engine:
+                                    st.caption(f"Recommend: Lower DPI to 300-400 for Qwen-VL")
+                                else:
+                                    st.caption(f"Tiles may be too large. Consider lowering DPI.")
+                            else:
+                                st.success(f"Tile size: {tile_width}x{tile_height}px ({tile_megapixels:.1f}MP) ✓")
+                                st.caption(f"Grid: {rows}x{cols} = {total_tiles} tiles")
+                                st.caption(f"Max tile size: {MAX_TILE_PIXELS}px for {ocr_engine}")
+                        else:
+                            st.success(f"Page size: {pixel_width}x{pixel_height}px - No tiling needed")
+                except Exception as e:
+                    pass  # Silently ignore errors in tile calculation
         with col_gpu:
             if "Qwen-VL" in ocr_engine:
                 st.success("✓ GPU acceleration (AMD ROCm) - High accuracy mode")
@@ -398,12 +456,19 @@ with workspace_tab:
                                 }
                                 selected_engine = engine_map.get(ocr_engine, "easyocr")
 
+                                # Get debug config from session state
+                                debug_config = st.session_state.get("ocr_debug_config", {"enabled": False})
+
                                 vectormap = pdf_to_vectormap(
                                     str(target_path),
                                     workers=worker_count,
                                     enable_ocr=True,
                                     ocr_dpi=ocr_dpi,
                                     ocr_engine=selected_engine,
+                                    debug_ocr=debug_config.get("enabled", False),
+                                    debug_output_dir=debug_config.get("output_dir"),
+                                    debug_conf_low=debug_config.get("confidence_threshold_low", 70),
+                                    debug_conf_high=debug_config.get("confidence_threshold_high", 90),
                                 )
                             else:
                                 vectormap = pdf_to_vectormap_server(

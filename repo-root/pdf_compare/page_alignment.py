@@ -18,6 +18,8 @@ Example:
         None  → New 7  (F is new)
 """
 
+# TODO: Port alignment helpers to DatabaseBackend; current implementation still expects legacy SQLite schemas.
+
 from __future__ import annotations
 import sqlite3
 from typing import List, Tuple, Optional, Dict

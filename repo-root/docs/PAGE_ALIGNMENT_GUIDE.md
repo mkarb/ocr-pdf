@@ -1,4 +1,5 @@
 # Page Alignment Guide
+> ⚠️ **Legacy Notice**: Page alignment currently depends on SQLite-era helpers and is pending migration to the PostgreSQL backend. See the TODO in pdf_compare/page_alignment.py.
 
 ## Overview
 
@@ -81,109 +82,16 @@ Pages are compared using a weighted scoring system:
 - **Time complexity**: O(n × m) with backtracking
 - **Best for**: Complex reorderings, maximum accuracy
 
-## Usage
+## Usage (Legacy Reference Only)
 
-### Python API
+> ⚠️ The alignment API still targets the retired SQLite infrastructure. The examples below are preserved for historical context and should not be executed against the current PostgreSQL backend. Porting work is tracked in `pdf_compare/page_alignment.py`.
 
-#### Basic Usage
-
-```python
-import sqlite3
-from pdf_compare.page_alignment import align_pages
-from pdf_compare.compare import diff_documents_aligned
-
-# Connect to database
-conn = sqlite3.connect("vectormap.sqlite")
-
-# Align pages between documents
-alignments = align_pages(
-    conn,
-    old_id="doc_v1",
-    new_id="doc_v2",
-    method="dynamic",  # or "greedy"
-    similarity_threshold=0.5  # 50% minimum similarity
-)
-
-# Print alignment results
-for old_pg, new_pg, score in alignments:
-    if old_pg and new_pg:
-        print(f"Page {old_pg} → {new_pg} (similarity: {score:.2%})")
-    elif old_pg:
-        print(f"Page {old_pg} was DELETED")
-    else:
-        print(f"Page {new_pg} was INSERTED")
+```text
+Pending migration steps:
+- Reimplement `align_pages` using `DatabaseBackend` sessions
+- Emit alignment metadata compatible with `compare_new.diff_documents`
+- Re-enable CLI/Streamlit toggles once the new backend is available
 ```
-
-#### Aligned Comparison
-
-```python
-# Perform comparison using aligned pages
-diffs, alignments = diff_documents_aligned(
-    conn,
-    old_id="doc_v1",
-    new_id="doc_v2",
-    alignment_method="dynamic",
-    similarity_threshold=0.5
-)
-
-# Process diffs
-for diff in diffs:
-    page_num = diff["page"]
-    alignment_info = diff.get("alignment", {})
-
-    status = alignment_info.get("status")
-    if status == "matched":
-        old_pg = alignment_info["old_page"]
-        new_pg = alignment_info["new_page"]
-        sim = alignment_info["similarity"]
-        print(f"Page {old_pg}→{new_pg} (sim: {sim:.2%})")
-        print(f"  Added geometries: {len(diff['geometry']['added'])}")
-        print(f"  Removed geometries: {len(diff['geometry']['removed'])}")
-    elif status == "inserted":
-        print(f"Page {page_num} INSERTED")
-    elif status == "deleted":
-        print(f"Page {page_num} DELETED")
-```
-
-#### Get Alignment Summary
-
-```python
-from pdf_compare.page_alignment import get_alignment_summary
-
-summary = get_alignment_summary(alignments)
-print(f"Total alignments: {summary['total_alignments']}")
-print(f"Matched pages: {summary['matched_pages']}")
-print(f"Deleted pages: {summary['deleted_pages']}")
-print(f"Inserted pages: {summary['inserted_pages']}")
-print(f"Average similarity: {summary['average_similarity']:.2%}")
-```
-
-### CLI Usage
-
-```bash
-# Compare with automatic page alignment
-compare-pdf-revs compare old.pdf new.pdf --aligned --method dynamic
-
-# Compare with custom similarity threshold
-compare-pdf-revs compare old.pdf new.pdf --aligned --similarity-threshold 0.7
-
-# Show alignment information only (no diff)
-compare-pdf-revs align old.pdf new.pdf --method greedy
-```
-
-### Streamlit UI
-
-The Streamlit UI includes an "Enable Page Alignment" checkbox in the comparison section:
-
-1. Upload and ingest both PDF versions
-2. Select old and new documents
-3. ✓ Check "Enable Page Alignment"
-4. Click "Compare"
-5. View alignment visualization showing:
-   - Matched pages with similarity scores
-   - Inserted pages (green badge)
-   - Deleted pages (red badge)
-   - Page mapping diagram
 
 ## Configuration
 
@@ -383,6 +291,7 @@ def align_pages(
 
 **Returns**: List of `(old_page, new_page, similarity_score)` tuples
 
+> ⚠️ This legacy implementation lived in `pdf_compare/compare.py` and is archived for reference only.
 ### `diff_documents_aligned()`
 
 ```python
