@@ -5,10 +5,13 @@ Shows extracted text with confidence scores, allows filtering by confidence,
 and displays visual debug output.
 """
 
-import streamlit as st
-from pathlib import Path
 import json
+from pathlib import Path
+
+import streamlit as st
 from PIL import Image
+
+from debug_utils import get_ocr_debug_config, resolve_debug_output_dir
 
 # Increase PIL decompression bomb limit for large debug images
 # Debug images can be very large (e.g., 1200 DPI renders)
@@ -185,9 +188,8 @@ with col2:
     st.subheader("Debug Output")
 
     # Get debug directory from session state, fallback to default
-    debug_config = st.session_state.get("ocr_debug_config", {})
-    debug_dir_str = debug_config.get("output_dir", "./debug/ocr")
-    debug_dir = Path(debug_dir_str)
+    debug_config = get_ocr_debug_config()
+    debug_dir = resolve_debug_output_dir(debug_config)
 
     if debug_dir.exists():
         page_prefix = f"page_{selected_page:03d}_"

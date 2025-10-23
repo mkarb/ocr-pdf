@@ -8,6 +8,7 @@ from .compare_new import diff_documents
 from .overlay import write_overlay
 from .raster_grid import raster_grid_changed_boxes
 from .analyzers.highres_ocr import highres_ocr, HighResOCRConfig
+from .analyzers.qwen_prompts import PROMPT_MODE_CHOICES, DEFAULT_PROMPT_MODE
 import fitz
 
 app = typer.Typer(add_completion=False)
@@ -46,7 +47,23 @@ def ingest(
         False,
         "--server",
         help="Use server-optimized extraction (no Streamlit compatibility, better performance)"
-    )
+    ),
+    enable_ocr: bool = typer.Option(
+        False,
+        "--enable-ocr",
+        help="Enable OCR during ingestion (uses --ocr-engine)",
+    ),
+    ocr_engine: str = typer.Option(
+        "easyocr",
+        "--ocr-engine",
+        help="OCR engine to use when --enable-ocr is set (tesseract|easyocr|qwen-vl)",
+        case_sensitive=False,
+    ),
+    qwen_prompt_mode: str = typer.Option(
+        DEFAULT_PROMPT_MODE,
+        "--qwen-prompt",
+        help=f"Prompt preset for Qwen-VL OCR (layout, sparse, table)",
+    ),
 ):
     """
     Ingest a PDF into the PostgreSQL database.
@@ -57,15 +74,48 @@ def ingest(
         export DATABASE_URL=postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare
         compare-pdf-revs ingest document.pdf
     """
+    valid_engines = {"tesseract", "easyocr", "qwen-vl"}
+    engine = ocr_engine.lower()
+    prompt_mode = qwen_prompt_mode.lower()
+
+    if engine not in valid_engines:
+        typer.echo(
+            f"[ERROR] Unsupported OCR engine '{ocr_engine}'. Valid options: {', '.join(sorted(valid_engines))}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if prompt_mode not in PROMPT_MODE_CHOICES:
+        typer.echo(
+            f"[ERROR] Invalid Qwen prompt mode '{qwen_prompt_mode}'. Valid options: {', '.join(PROMPT_MODE_CHOICES)}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if engine == "qwen-vl" and not enable_ocr:
+        typer.echo('[INFO] Enabling OCR because --ocr-engine is qwen-vl.')
+        enable_ocr = True
+
     if use_server_mode or os.getenv("PDF_SERVER_MODE"):
+        if enable_ocr:
+            typer.echo('[ERROR] Server mode does not currently support --enable-ocr.', err=True)
+            raise typer.Exit(code=1)
+
         from .pdf_extract_server import pdf_to_vectormap_server
+
         vm = pdf_to_vectormap_server(pdf, doc_id=doc_id)
     else:
-        vm = pdf_to_vectormap(pdf, doc_id=doc_id)
+        vm = pdf_to_vectormap(
+            pdf,
+            doc_id=doc_id,
+            enable_ocr=enable_ocr,
+            ocr_engine=engine,
+            qwen_prompt_mode=prompt_mode,
+        )
 
     backend = get_db_connection(db_url)
     upsert_vectormap(backend, vm)
-    typer.echo(f"✅ Ingested {vm.meta.path} as {vm.meta.doc_id} with {vm.meta.page_count} pages.")
+    typer.echo(f'[OK] Ingested {vm.meta.path} as {vm.meta.doc_id} with {vm.meta.page_count} pages.')
 
 @app.command()
 def search_text(

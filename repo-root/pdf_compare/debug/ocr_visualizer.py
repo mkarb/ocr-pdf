@@ -68,6 +68,18 @@ class OCRVisualizer:
         filename = f"page_{self.page_number:03d}_{self.stage_counter:02d}_{stage_name}{extension}"
         return self.config.output_dir / filename
 
+    def _write_image(self, output_path: Path, image: np.ndarray, description: str):
+        """Write an image to disk with consistent logging."""
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            success = cv2.imwrite(str(output_path), image)
+            if success:
+                print(f"[OCR DEBUG] Saved {description}: {output_path}", flush=True)
+            else:
+                print(f"[OCR DEBUG] Failed to save {description}: {output_path}", flush=True)
+        except Exception as exc:
+            print(f"[OCR DEBUG] Error saving {description}: {output_path} ({exc})", flush=True)
+
     def save_original(self, image: np.ndarray, dpi: int):
         """Stage 1: Save original rendered image."""
         if not self.config.enabled or not self.config.save_original:
@@ -86,16 +98,7 @@ class OCRVisualizer:
         cv2.putText(img_with_info, text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        try:
-            # Ensure parent directory exists
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            success = cv2.imwrite(str(output_path), img_with_info)
-            if success:
-                print(f"[OCR DEBUG] Saved: {output_path}", flush=True)
-            else:
-                print(f"[OCR DEBUG] Failed to save: {output_path}", flush=True)
-        except Exception as e:
-            print(f"[OCR DEBUG] Error saving {output_path}: {e}", flush=True)
+        self._write_image(output_path, img_with_info, "original render")
 
     def save_grayscale(self, gray: np.ndarray):
         """Stage 2: Save grayscale conversion."""
@@ -103,8 +106,7 @@ class OCRVisualizer:
             return
 
         output_path = self._get_output_path("grayscale")
-        cv2.imwrite(str(output_path), gray)
-        print(f"[DEBUG] Saved: {output_path}")
+        self._write_image(output_path, gray, "grayscale render")
 
     def save_preprocessed(self, processed: np.ndarray, preprocessing_info: Dict):
         """Stage 3: Save preprocessed image with applied filters."""
@@ -122,8 +124,7 @@ class OCRVisualizer:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
             y_offset += 25
 
-        cv2.imwrite(str(output_path), img_with_info)
-        print(f"[DEBUG] Saved: {output_path}")
+        self._write_image(output_path, img_with_info, "preprocessed render")
 
     def save_detections(self, image: np.ndarray, detections: List[Dict]):
         """
@@ -191,8 +192,7 @@ class OCRVisualizer:
         cv2.putText(img_color, f"Low (<{self.config.confidence_threshold_low}%)",
                    (35, legend_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        cv2.imwrite(str(output_path), img_color)
-        print(f"[DEBUG] Saved: {output_path}")
+        self._write_image(output_path, img_color, "detections overlay")
 
     def save_tiles(self, image: np.ndarray, tiles: List[Dict], processed_mask: np.ndarray):
         """
@@ -256,8 +256,7 @@ class OCRVisualizer:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             y_offset += 30
 
-        cv2.imwrite(str(output_path), img_color)
-        print(f"[DEBUG] Saved: {output_path}")
+        self._write_image(output_path, img_color, "tile grid overlay")
 
     def save_final_with_text(self, image: np.ndarray, results: List[Dict]):
         """
@@ -307,8 +306,7 @@ class OCRVisualizer:
             cv2.putText(img_color, label, (x0 + 2, y1 + label_h + 2),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-        cv2.imwrite(str(output_path), img_color)
-        print(f"[DEBUG] Saved: {output_path}")
+        self._write_image(output_path, img_color, "final text overlay")
 
     def save_confidence_heatmap(self, page_width: int, page_height: int, results: List[Dict]):
         """
@@ -323,7 +321,7 @@ class OCRVisualizer:
             return
 
         if not HAVE_MATPLOTLIB:
-            print("[DEBUG] Skipping heatmap: matplotlib not available")
+            print("[OCR DEBUG] Skipping heatmap: matplotlib not available")
             return
 
         output_path = self._get_output_path("confidence_heatmap")
@@ -372,7 +370,7 @@ class OCRVisualizer:
         plt.savefig(output_path, dpi=150)
         plt.close()
 
-        print(f"[DEBUG] Saved: {output_path}")
+        print(f"[OCR DEBUG] Saved confidence heatmap: {output_path}")
 
     def generate_summary_report(self, ocr_results: List[Dict], processing_time: float):
         """Generate summary report with confidence statistics."""
@@ -438,6 +436,95 @@ Low Confidence Texts (< {self.config.confidence_threshold_low}%):
             print(f"[OCR DEBUG] Saved: {output_path}", flush=True)
         except Exception as e:
             print(f"[OCR DEBUG] Error saving {output_path}: {e}", flush=True)
+
+    def save_layout_regions(self, image: np.ndarray, regions: List[Dict]):
+        """
+        Save detected layout regions (tables, diagrams, text blocks).
+
+        Args:
+            image: Grayscale or color image
+            regions: List of LayoutRegion objects or dicts with keys:
+                     {"bbox": (x1,y1,x2,y2), "region_type": str, "confidence": float, "metadata": dict}
+        """
+        if not self.config.enabled:
+            return
+
+        output_path = self._get_output_path("layout_regions")
+
+        # Convert to BGR for colored overlays
+        if len(image.shape) == 2:
+            img_color = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        else:
+            img_color = image.copy()
+
+        # Color map for region types
+        colors = {
+            "table": (0, 255, 0),      # Green
+            "diagram": (255, 0, 0),    # Blue
+            "text": (0, 165, 255),     # Orange
+            "mixed": (255, 255, 0)     # Cyan
+        }
+
+        # Draw each region
+        for region in regions:
+            # Handle both LayoutRegion objects and dicts
+            if hasattr(region, 'bbox'):
+                bbox = region.bbox
+                region_type = region.region_type
+                confidence = region.confidence
+            else:
+                bbox = region.get("bbox", (0, 0, 0, 0))
+                region_type = region.get("region_type", "mixed")
+                confidence = region.get("confidence", 0)
+
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            color = colors.get(region_type, (128, 128, 128))
+
+            # Draw bounding box
+            cv2.rectangle(img_color, (x1, y1), (x2, y2), color, 3)
+
+            # Draw label
+            label = f"{region_type} {confidence:.0f}%"
+            font_scale = 0.8
+            thickness = 2
+            (label_w, label_h), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+            )
+
+            # Background for label
+            cv2.rectangle(
+                img_color,
+                (x1, y1 - label_h - baseline - 5),
+                (x1 + label_w + 5, y1),
+                color,
+                -1
+            )
+
+            # Label text
+            cv2.putText(
+                img_color, label, (x1 + 2, y1 - baseline - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness
+            )
+
+        # Add legend
+        legend_y = 30
+        legend_x = 10
+        cv2.rectangle(img_color, (legend_x - 5, 5), (legend_x + 350, legend_y + 90), (255, 255, 255), -1)
+        cv2.rectangle(img_color, (legend_x - 5, 5), (legend_x + 350, legend_y + 90), (0, 0, 0), 2)
+
+        cv2.putText(img_color, "Layout Regions:", (legend_x, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        legend_y += 25
+        cv2.putText(img_color, "Green = Table | Blue = Diagram", (legend_x, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+        legend_y += 20
+        cv2.putText(img_color, "Orange = Text | Cyan = Mixed", (legend_x, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+        legend_y += 20
+        cv2.putText(img_color, f"Total Regions: {len(regions)}", (legend_x, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+        self._write_image(output_path, img_color, "layout regions")
 
 
 # Convenience function for integration

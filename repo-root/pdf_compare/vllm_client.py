@@ -212,7 +212,8 @@ class VLLMClient:
         self,
         image: np.ndarray,
         focus_technical: bool = True,
-        min_confidence: float = 0.5
+        min_confidence: float = 0.5,
+        prompt: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Extract text from image using Vision-Language Model.
@@ -223,6 +224,7 @@ class VLLMClient:
             image: Image as numpy array (grayscale or RGB)
             focus_technical: Optimize for engineering documents
             min_confidence: Minimum confidence threshold (0.0-1.0)
+            prompt: Optional instruction prompt for the OCR model
 
         Returns:
             List of dicts with keys:
@@ -248,13 +250,17 @@ class VLLMClient:
             image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
             # Call OCR endpoint
+            payload = {
+                "image_base64": image_base64,
+                "focus_technical": focus_technical,
+                "min_confidence": min_confidence,
+            }
+            if prompt:
+                payload["prompt"] = prompt
+
             response = requests.post(
                 f"{self.base_url}/api/v1/ocr",
-                json={
-                    "image_base64": image_base64,
-                    "focus_technical": focus_technical,
-                    "min_confidence": min_confidence
-                },
+                json=payload,
                 timeout=self.timeout * 3,  # OCR takes longer
                 verify=self.verify_ssl
             )
@@ -272,7 +278,8 @@ class VLLMClient:
         image_width: int,
         image_height: int,
         focus_technical: bool = True,
-        min_confidence: float = 0.5
+        min_confidence: float = 0.5,
+        prompt: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Extract text and convert bbox percentages to pixel coordinates.
@@ -283,11 +290,17 @@ class VLLMClient:
             image_height: Image height in pixels
             focus_technical: Optimize for engineering docs
             min_confidence: Minimum confidence
+            prompt: Optional instruction prompt shared with the OCR endpoint
 
         Returns:
             List of dicts with bbox in pixel coordinates
         """
-        results = self.ocr_image(image, focus_technical, min_confidence)
+        results = self.ocr_image(
+            image,
+            focus_technical=focus_technical,
+            min_confidence=min_confidence,
+            prompt=prompt,
+        )
 
         # Convert percentage bboxes to pixel coordinates
         for item in results:

@@ -25,6 +25,7 @@ from shapely.wkb import dumps as wkb_dumps
 from .models import (
     VectorMap, DocMeta, PageVectors, VectorGeom, GeoKind, TextRun, BBox
 )
+from .analyzers.qwen_prompts import DEFAULT_PROMPT_MODE as DEFAULT_QWEN_PROMPT_MODE
 
 # -----------------------
 # Defaults / Tunables
@@ -144,6 +145,11 @@ def _extract_text(
     debug_output_dir: Optional[str] = None,
     debug_conf_low: int = 70,
     debug_conf_high: int = 90,
+    enable_layout_detection: bool = False,
+    table_dpi_boost: float = 1.5,
+    enable_upscaling: bool = False,
+    upscale_factor: float = 1.5,
+    qwen_prompt_mode: str = DEFAULT_QWEN_PROMPT_MODE,
 ) -> List[Dict[str, Any]]:
     """
     Extract native text spans as plain dicts: {"text": str, "bbox": (x0,y0,x1,y1), "font": str|None, "size": float|None}
@@ -155,6 +161,11 @@ def _extract_text(
         debug_output_dir: directory to save debug images
         debug_conf_low: low confidence threshold for visualization
         debug_conf_high: high confidence threshold for visualization
+        enable_layout_detection: Run layout-aware OCR heuristics (tables/diagrams)
+        table_dpi_boost: DPI multiplier for regions classified as tables
+        enable_upscaling: Upscale tiles before OCR to enhance small text
+        upscale_factor: Upscaling multiplier when enable_upscaling is True
+        qwen_prompt_mode: Prompt preset to use when ocr_engine == "qwen-vl"
     """
     runs: List[Dict[str, Any]] = []
     raw = page.get_text("dict") or {}
@@ -232,7 +243,12 @@ def _extract_text(
                     use_dual_psm=True,  # Use both PSM 11 and PSM 6 for better text capture (Tesseract only)
                     engine=ocr_engine,  # Use user-selected OCR engine
                     use_gpu=True,       # Enable GPU acceleration
-                    debug_visualizer=debug_visualizer  # Pass debug visualizer
+                    debug_visualizer=debug_visualizer,  # Pass debug visualizer
+                    enable_layout_detection=enable_layout_detection,
+                    table_dpi_boost=table_dpi_boost,
+                    enable_upscaling=enable_upscaling,
+                    upscale_factor=upscale_factor,
+                    qwen_prompt_mode=qwen_prompt_mode,
                 )
 
                 print(f"OCR: page {page_index+1}: Tiled OCR complete - {report.tiles_processed}/{report.total_tiles} tiles processed, {report.tiles_skipped_empty} skipped, {len(ocr_results)} text items, {report.duplicates_removed} duplicates removed", file=sys.stderr)
@@ -241,7 +257,14 @@ def _extract_text(
                 # Use whole-page OCR for pages that fit
                 print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using whole-page OCR at {dpi} DPI", file=sys.stderr)
 
-                config = HighResOCRConfig(dpi=dpi, psm=11, min_conf=50, engine=ocr_engine, use_gpu=True)
+                config = HighResOCRConfig(
+                    dpi=dpi,
+                    psm=11,
+                    min_conf=50,
+                    engine=ocr_engine,
+                    use_gpu=True,
+                    qwen_prompt_mode=qwen_prompt_mode,
+                )
                 ocr_results = highres_ocr(pdf_path, page_index, config, debug_visualizer=debug_visualizer)
 
                 print(f"OCR: page {page_index+1}: Extracted {len(ocr_results)} text items", file=sys.stderr)
@@ -289,6 +312,11 @@ def _extract_page_job(
     debug_output_dir: Optional[str] = None,
     debug_conf_low: int = 70,
     debug_conf_high: int = 90,
+    enable_layout_detection: bool = False,
+    table_dpi_boost: float = 1.5,
+    enable_upscaling: bool = False,
+    upscale_factor: float = 1.5,
+    qwen_prompt_mode: str = DEFAULT_QWEN_PROMPT_MODE,
 ) -> Dict[str, Any]:
     """
     Isolated worker: Extract one page → return pure Python dict.
@@ -317,6 +345,11 @@ def _extract_page_job(
         debug_output_dir=debug_output_dir,
         debug_conf_low=debug_conf_low,
         debug_conf_high=debug_conf_high,
+        enable_layout_detection=enable_layout_detection,
+        table_dpi_boost=table_dpi_boost,
+        enable_upscaling=enable_upscaling,
+        upscale_factor=upscale_factor,
+        qwen_prompt_mode=qwen_prompt_mode,
     )
 
     out = {
@@ -350,6 +383,11 @@ def pdf_to_vectormap(
     debug_output_dir: Optional[str] = None,   # Output directory for debug images
     debug_conf_low: int = 70,                 # Low confidence threshold for visualization
     debug_conf_high: int = 90,                # High confidence threshold for visualization
+    enable_layout_detection: bool = False,    # Enable layout-aware OCR (tables/diagrams)
+    table_dpi_boost: float = 1.5,             # DPI multiplier for table regions
+    enable_upscaling: bool = False,           # Enable upscaling preprocessing for small text
+    upscale_factor: float = 1.5,              # Upscaling multiplier (1.5-2.0 recommended)
+    qwen_prompt_mode: str = DEFAULT_QWEN_PROMPT_MODE,         # Prompt preset when using Qwen-VL
 ) -> VectorMap:
     """
     Parallel, high-throughput ingest.
@@ -364,6 +402,11 @@ def pdf_to_vectormap(
     - debug_output_dir: directory to save debug images (default: ./debug/ocr)
     - debug_conf_low: low confidence threshold for visualization (default: 70)
     - debug_conf_high: high confidence threshold for visualization (default: 90)
+    - enable_layout_detection: enable layout-aware heuristics (tables/diagrams)
+    - table_dpi_boost: DPI multiplier applied to table regions when layout detection is enabled
+    - enable_upscaling: upscale tiles before OCR to enhance small text
+    - upscale_factor: scaling multiplier when upscaling is enabled
+    - qwen_prompt_mode: Qwen2-VL prompt preset ("sparse", "layout", or "table")
     """
     p = Path(path)
     if not p.exists():
@@ -426,6 +469,10 @@ def pdf_to_vectormap(
                     debug_output_dir=debug_output_dir,
                     debug_conf_low=debug_conf_low,
                     debug_conf_high=debug_conf_high,
+                    enable_layout_detection=enable_layout_detection,
+                    table_dpi_boost=table_dpi_boost,
+                    enable_upscaling=enable_upscaling,
+                    upscale_factor=upscale_factor,
                 )
             )
     else:
@@ -447,6 +494,11 @@ def pdf_to_vectormap(
                     debug_output_dir,
                     debug_conf_low,
                     debug_conf_high,
+                    enable_layout_detection,
+                    table_dpi_boost,
+                    enable_upscaling,
+                    upscale_factor,
+                    qwen_prompt_mode,
                 )
 
             page_dicts = pool.submit_throttled(
@@ -493,3 +545,4 @@ def pdf_to_vectormap(
 
     meta = DocMeta(doc_id=doc_id, path=str(p.resolve()), page_count=page_count)
     return VectorMap(meta=meta, pages=pages)
+

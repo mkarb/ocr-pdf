@@ -56,6 +56,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from streamlit_session_manager import SessionManager, init_session
+from debug_utils import (
+    DEFAULT_OCR_DEBUG_DIR,
+    get_ocr_debug_config,
+    update_ocr_debug_session,
+)
 
 try:
     import psutil  # type: ignore
@@ -176,31 +181,79 @@ enable_ocr_debug = st.sidebar.checkbox(
 if enable_ocr_debug:
     debug_output_dir = st.sidebar.text_input(
         "Debug Output Directory",
-        value="./debug/ocr",
-        help="Directory to save debug images"
+        value=DEFAULT_OCR_DEBUG_DIR,
+        help="Directory to save debug images",
     )
 
     conf_threshold_low = st.sidebar.slider(
         "Low Confidence Threshold",
-        min_value=0, max_value=100, value=70,
-        help="Text below this confidence will be marked red"
+        min_value=0,
+        max_value=100,
+        value=70,
+        help="Text below this confidence will be marked red",
     )
 
     conf_threshold_high = st.sidebar.slider(
         "High Confidence Threshold",
-        min_value=0, max_value=100, value=90,
-        help="Text above this confidence will be marked green"
+        min_value=0,
+        max_value=100,
+        value=90,
+        help="Text above this confidence will be marked green",
     )
 
-    # Store in session state
-    st.session_state["ocr_debug_config"] = {
-        "enabled": enable_ocr_debug,
-        "output_dir": debug_output_dir,
-        "confidence_threshold_low": conf_threshold_low,
-        "confidence_threshold_high": conf_threshold_high,
-    }
+    update_ocr_debug_session(
+        True,
+        debug_output_dir,
+        conf_threshold_low,
+        conf_threshold_high,
+    )
 else:
-    st.session_state["ocr_debug_config"] = {"enabled": False}
+    update_ocr_debug_session(False, None, 70, 90)
+
+# Layout Detection & Preprocessing
+st.sidebar.subheader("Layout Detection")
+
+enable_layout_detection = st.sidebar.checkbox(
+    "Enable Layout-Aware OCR",
+    value=False,
+    help="Detect tables, diagrams, and text blocks for specialized processing"
+)
+
+if enable_layout_detection:
+    table_dpi_boost = st.sidebar.slider(
+        "Table DPI Boost",
+        min_value=1.0,
+        max_value=2.5,
+        value=1.5,
+        step=0.1,
+        help="Multiply DPI for table regions (e.g., 1.5 = 1.5x higher DPI for tables)"
+    )
+
+    st.sidebar.caption(f"Example: Base DPI 1000 → Tables at {int(1000 * table_dpi_boost)} DPI")
+else:
+    table_dpi_boost = 1.5  # Default
+
+st.sidebar.subheader("Preprocessing")
+
+enable_upscaling = st.sidebar.checkbox(
+    "Enable Image Upscaling",
+    value=False,
+    help="Upscale tiles before OCR for better small text detection"
+)
+
+if enable_upscaling:
+    upscale_factor = st.sidebar.slider(
+        "Upscale Factor",
+        min_value=1.0,
+        max_value=2.5,
+        value=1.5,
+        step=0.1,
+        help="Upscaling multiplier (1.5-2.0 recommended). Includes CLAHE + sharpening."
+    )
+
+    st.sidebar.caption(f"Effective DPI: {int(500 * upscale_factor)} (if base = 500)")
+else:
+    upscale_factor = 1.5  # Default
 
 
 @st.cache_resource(show_spinner=False)
@@ -457,7 +510,7 @@ with workspace_tab:
                                 selected_engine = engine_map.get(ocr_engine, "easyocr")
 
                                 # Get debug config from session state
-                                debug_config = st.session_state.get("ocr_debug_config", {"enabled": False})
+                                debug_config = get_ocr_debug_config()
 
                                 vectormap = pdf_to_vectormap(
                                     str(target_path),
@@ -469,6 +522,10 @@ with workspace_tab:
                                     debug_output_dir=debug_config.get("output_dir"),
                                     debug_conf_low=debug_config.get("confidence_threshold_low", 70),
                                     debug_conf_high=debug_config.get("confidence_threshold_high", 90),
+                                    enable_layout_detection=enable_layout_detection,
+                                    table_dpi_boost=table_dpi_boost,
+                                    enable_upscaling=enable_upscaling,
+                                    upscale_factor=upscale_factor,
                                 )
                             else:
                                 vectormap = pdf_to_vectormap_server(

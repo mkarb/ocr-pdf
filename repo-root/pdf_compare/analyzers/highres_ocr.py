@@ -51,6 +51,8 @@ except ImportError:
     _QWEN_VL_OCR = None
     VLLMServiceUnavailable = Exception  # Fallback
 
+from .qwen_prompts import DEFAULT_PROMPT_MODE as DEFAULT_QWEN_PROMPT_MODE
+
 BBox = Tuple[float, float, float, float]  # x0,y0,x1,y1 in PDF user space
 
 @dataclass(frozen=True)
@@ -64,6 +66,10 @@ class HighResOCRConfig:
     # The following are here for future page batching; for a single page they are inert
     max_workers: int = 1
     ram_budget_mb: int = 4096
+    # Preprocessing enhancements for small text
+    upscale_factor: float = 1.0      # Upscaling multiplier (1.0 = no upscaling, 1.5-2.0 recommended for small text)
+    enable_sharpening: bool = False  # Apply unsharp mask after upscaling
+    qwen_prompt_mode: str = DEFAULT_QWEN_PROMPT_MODE  # Prompt mode for Qwen2-VL (layout|sparse|table)
 
 # ========================
 # Tiled OCR Data Structures
@@ -178,7 +184,42 @@ def _ocr_tile_easyocr(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
     Run EasyOCR on a grayscale tile. Returns list of dicts:
     {"text": str, "bbox": (x0,y0,x1,y1), "conf": int}
     (bbox is in TILE pixel coords; caller maps to PDF coords)
+
+    If tile exceeds EasyOCR's size limits, recursively splits into sub-tiles.
     """
+    height, width = gray.shape
+    EASYOCR_MAX_DIM = 32000  # OpenCV limit is 32767, use safety margin
+
+    # Check if tile exceeds EasyOCR's size limits
+    if width > EASYOCR_MAX_DIM or height > EASYOCR_MAX_DIM:
+        import sys
+        print(f"[EasyOCR] Tile {width}x{height}px exceeds {EASYOCR_MAX_DIM}px limit - splitting into sub-tiles", file=sys.stderr)
+
+        # Split into 2x2 grid (4 sub-tiles)
+        mid_x = width // 2
+        mid_y = height // 2
+
+        sub_tiles = [
+            (gray[0:mid_y, 0:mid_x], 0, 0),           # Top-left
+            (gray[0:mid_y, mid_x:width], mid_x, 0),   # Top-right
+            (gray[mid_y:height, 0:mid_x], 0, mid_y),  # Bottom-left
+            (gray[mid_y:height, mid_x:width], mid_x, mid_y)  # Bottom-right
+        ]
+
+        # Recursively process each sub-tile
+        all_results = []
+        for sub_tile, offset_x, offset_y in sub_tiles:
+            sub_results = _ocr_tile_easyocr(sub_tile, cfg)  # Recursive call
+
+            # Offset bboxes to original tile coordinates
+            for result in sub_results:
+                x0, y0, x1, y1 = result["bbox"]
+                result["bbox"] = (x0 + offset_x, y0 + offset_y, x1 + offset_x, y1 + offset_y)
+                all_results.append(result)
+
+        return all_results
+
+    # Normal processing for tiles under size limit
     reader = _get_easyocr_reader(lang=cfg.lang, use_gpu=cfg.use_gpu)
 
     # EasyOCR works best with minimal preprocessing
@@ -213,12 +254,56 @@ def _ocr_tile_easyocr(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
     return out
 
 
-def _ocr_tile_tesseract(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
+def _preprocess_tile_upscale(gray: np.ndarray, upscale_factor: float = 1.5, enable_sharpening: bool = True) -> Tuple[np.ndarray, float]:
+    """
+    Upscale and enhance a tile for better OCR accuracy on small text.
+
+    Args:
+        gray: Grayscale input image
+        upscale_factor: Upscaling multiplier (1.5-2.0 recommended)
+        enable_sharpening: Apply unsharp mask after upscaling
+
+    Returns:
+        (upscaled_image, actual_scale_factor)
+    """
+    if upscale_factor <= 1.0:
+        return gray, 1.0
+
+    # Calculate new dimensions
+    new_width = int(gray.shape[1] * upscale_factor)
+    new_height = int(gray.shape[0] * upscale_factor)
+
+    # Upscale using Lanczos interpolation (best for text)
+    upscaled = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
+
+    # Apply CLAHE for better contrast
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    upscaled = clahe.apply(upscaled)
+
+    # Optional: Sharpen using unsharp mask
+    if enable_sharpening:
+        # Gaussian blur
+        blurred = cv2.GaussianBlur(upscaled, (0, 0), sigmaX=1.0)
+        # Unsharp mask: original + (original - blurred) * strength
+        upscaled = cv2.addWeighted(upscaled, 1.5, blurred, -0.5, 0)
+        # Clip to valid range
+        upscaled = np.clip(upscaled, 0, 255).astype(np.uint8)
+
+    return upscaled, upscale_factor
+
+
+def _ocr_tile_tesseract(gray: np.ndarray, cfg: HighResOCRConfig, upscale_factor: float = 1.0, enable_sharpening: bool = False) -> List[Dict]:
     """
     Run Tesseract on a grayscale tile. Returns list of dicts:
     {"text": str, "bbox": (x0,y0,x1,y1), "conf": int}
     (bbox is in TILE pixel coords; caller maps to PDF coords)
     """
+    # Optional upscaling for small text
+    if upscale_factor > 1.0:
+        gray, actual_scale = _preprocess_tile_upscale(gray, upscale_factor, enable_sharpening)
+    else:
+        actual_scale = 1.0
+
     # Enhanced preprocessing for engineering drawings
     # 1. Denoise with bilateral filter (preserves edges better than Gaussian)
     proc = cv2.bilateralFilter(gray, 9, 75, 75)
@@ -248,6 +333,11 @@ def _ocr_tile_tesseract(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
         if not txt or conf < cfg.min_conf:
             continue
         x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+
+        # Scale bounding boxes back to original size if upscaled
+        if actual_scale > 1.0:
+            x, y, w, h = x / actual_scale, y / actual_scale, w / actual_scale, h / actual_scale
+
         out.append({
             "text": txt,
             "bbox": (float(x), float(y), float(x+w), float(y+h)),
@@ -282,7 +372,11 @@ def _ocr_tile_qwen_vl(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
 
     # Extract text using VLM service (sends HTTP request)
     try:
-        results = _QWEN_VL_OCR.extract_text_from_image(gray, focus_technical=True)
+        results = _QWEN_VL_OCR.extract_text_from_image(
+            gray,
+            focus_technical=True,
+            prompt_mode=cfg.qwen_prompt_mode,
+        )
     except VLLMServiceUnavailable:
         import sys
         print(f"OCR: vLLM service unavailable, fallback required", file=sys.stderr)
@@ -316,7 +410,7 @@ def _ocr_tile(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
     elif cfg.engine == "easyocr":
         return _ocr_tile_easyocr(gray, cfg)
     else:
-        return _ocr_tile_tesseract(gray, cfg)
+        return _ocr_tile_tesseract(gray, cfg, cfg.upscale_factor, cfg.enable_sharpening)
 
 def highres_ocr(
     pdf_path: str,
@@ -420,31 +514,16 @@ def highres_ocr(
                 "source": s.get("source", "ocr")
             })
 
-    # STAGE 4: Save detections with confidence overlay
-    if debug_visualizer:
-        debug_visualizer.save_detections(gray, [
-            {"text": r["text"], "bbox": [v*zoom for v in r["bbox"]], "conf": r.get("conf", 0)}
-            for r in results
-        ])
-
-    # STAGE 6: Save final results with text
-    if debug_visualizer:
-        debug_visualizer.save_final_with_text(gray, [
-            {"text": r["text"], "bbox": [v*zoom for v in r["bbox"]], "conf": r.get("conf", 0)}
-            for r in results
-        ])
-
-    # STAGE 7: Confidence heatmap
-    if debug_visualizer:
-        debug_visualizer.save_confidence_heatmap(w, h, [
-            {"bbox": [v*zoom for v in r["bbox"]], "conf": r.get("conf", 0)}
-            for r in results
-        ])
-
-    # Generate summary report
     if debug_visualizer:
         processing_time = time.time() - start_time
-        debug_visualizer.generate_summary_report(results, processing_time)
+        _emit_debug_visuals(
+            debug_visualizer,
+            gray,
+            results,
+            zoom,
+            include_initial=False,
+            processing_time=processing_time,
+        )
     return results
 
 
@@ -798,6 +877,48 @@ def merge_and_deduplicate(
     return [r for i, r in enumerate(sorted_results) if keep_mask[i]]
 
 
+def _emit_debug_visuals(
+    visualizer: Optional['OCRVisualizer'],
+    base_image: np.ndarray,
+    results_pdf: List[Dict[str, Any]],
+    zoom: float,
+    *,
+    include_initial: bool = False,
+    initial_dpi: Optional[int] = None,
+    processing_time: Optional[float] = None,
+) -> None:
+    """
+    Emit standard debug visualizations for OCR stages.
+    """
+    if not visualizer or not visualizer.config.enabled:
+        return
+
+    results_px = [
+        {
+            "text": res.get("text", ""),
+            "bbox": [int(round(v * zoom)) for v in res.get("bbox", (0, 0, 0, 0))],
+            "conf": res.get("conf", 0),
+        }
+        for res in results_pdf
+    ]
+
+    if include_initial:
+        if initial_dpi is not None:
+            visualizer.save_original(base_image, initial_dpi)
+        visualizer.save_grayscale(base_image)
+
+    visualizer.save_detections(base_image, results_px)
+    visualizer.save_final_with_text(base_image, results_px)
+    visualizer.save_confidence_heatmap(
+        base_image.shape[1],
+        base_image.shape[0],
+        results_px
+    )
+
+    if processing_time is not None:
+        visualizer.generate_summary_report(results_pdf, processing_time)
+
+
 def tiled_ocr(
     pdf_path: str,
     page_index: int,
@@ -813,7 +934,12 @@ def tiled_ocr(
     use_dual_psm: bool = True,  # Try both PSM 11 and PSM 6 (Tesseract only)
     engine: str = "tesseract",  # OCR engine: "tesseract" or "easyocr"
     use_gpu: bool = True,       # Use GPU if available (EasyOCR only)
-    debug_visualizer: Optional['OCRVisualizer'] = None  # Optional debug visualizer
+    debug_visualizer: Optional['OCRVisualizer'] = None,  # Optional debug visualizer
+    enable_layout_detection: bool = False,  # Enable layout-aware OCR
+    table_dpi_boost: float = 1.5,  # DPI multiplier for table regions (1.5 = 1.5x higher DPI)
+    enable_upscaling: bool = False,  # Enable upscaling preprocessing for small text
+    upscale_factor: float = 1.5,  # Upscaling factor (1.5-2.0 recommended)
+    qwen_prompt_mode: str = DEFAULT_QWEN_PROMPT_MODE,  # Prompt preset when engine == "qwen-vl"
 ) -> List[Dict[str, Any]] | Tuple[List[Dict[str, Any]], TileOCRReport]:
     """
     Perform tiled OCR on a large PDF page.
@@ -833,6 +959,11 @@ def tiled_ocr(
         use_dual_psm: If True, runs both PSM 11 and PSM 6, merges results (Tesseract only)
         engine: OCR engine to use ("tesseract" or "easyocr")
         use_gpu: Enable GPU acceleration (EasyOCR only, requires CUDA)
+        enable_layout_detection: Use layout-aware heuristics (tables/diagrams)
+        table_dpi_boost: DPI multiplier applied to layout-detected tables
+        enable_upscaling: Upscale tiles before OCR to enhance small text
+        upscale_factor: Upscaling multiplier when enable_upscaling is True
+        qwen_prompt_mode: Prompt preset when engine == "qwen-vl"
 
     Returns:
         List of OCR results as dicts: {"text": str, "bbox": tuple, "conf": int}
@@ -853,6 +984,46 @@ def tiled_ocr(
     page_width = page.rect.width
     page_height = page.rect.height
     doc.close()
+
+    # Layout detection (if enabled)
+    layout_regions = []
+    layout_dpi = 400  # Default layout detection DPI
+    if enable_layout_detection:
+        import sys
+        try:
+            from .layout_detector import LayoutDetector
+
+            # Adaptive LAYOUT_DPI based on page size
+            # Large engineering drawings need higher DPI for accurate table grid detection
+            page_size_inches = max(page_width / 72.0, page_height / 72.0)
+            layout_dpi = 200 if page_size_inches > 50 else 150
+
+            print(f"[Layout] Page size: {page_width/72.0:.1f}\" x {page_height/72.0:.1f}\" → Using {layout_dpi} DPI for layout detection", file=sys.stderr)
+            layout_gray, layout_zoom = _render_page_gray(pdf_path, page_index, layout_dpi)
+
+            # Detect regions
+            detector_debug = bool(debug_visualizer and debug_visualizer.config.enabled)
+            detector = LayoutDetector(debug=detector_debug)
+            layout_regions = detector.analyze_page(layout_gray)
+
+            print(f"[Layout] Detected {len(layout_regions)} regions:", file=sys.stderr)
+            for i, region in enumerate(layout_regions):
+                print(f"  {i+1}. {region.region_type} @ {region.bbox} (conf={region.confidence:.1f}%)", file=sys.stderr)
+
+            # Save layout visualization to debug output
+            if debug_visualizer and debug_visualizer.config.enabled:
+                try:
+                    debug_visualizer.save_layout_regions(layout_gray, layout_regions)
+                except Exception as viz_error:
+                    print(f"[Layout] Warning: Failed to save layout visualization: {viz_error}", file=sys.stderr)
+
+        except ImportError as e:
+            print(f"[Layout] Warning: layout_detector module not available ({e}). Proceeding with standard OCR.", file=sys.stderr)
+            enable_layout_detection = False  # Disable if module unavailable
+        except Exception as e:
+            print(f"[Layout] Error during layout detection ({e}). Proceeding with standard OCR.", file=sys.stderr)
+            enable_layout_detection = False  # Disable on any error
+            layout_regions = []  # Clear any partial results
 
     # Engine-specific tile size limits
     # Qwen-VL (vision model): Small tiles (4K) to avoid decompression bomb errors
@@ -895,26 +1066,69 @@ def tiled_ocr(
             tile_height = sample_tile.py1 - sample_tile.py0
             print(f"OCR: First tile size: {tile_width}x{tile_height} pixels", file=sys.stderr)
 
+    # Helper function to check if tile overlaps with a table region
+    def tile_overlaps_table(tile: TileBounds, regions: List, layout_zoom_factor: float) -> bool:
+        """Check if tile overlaps with any table region (at layout DPI scale)."""
+        if not regions:
+            return False
+
+        # Convert tile PDF coords to layout pixel coords
+        tile_x0 = int(tile.pdf_x0 * layout_zoom_factor)
+        tile_y0 = int(tile.pdf_y0 * layout_zoom_factor)
+        tile_x1 = int(tile.pdf_x1 * layout_zoom_factor)
+        tile_y1 = int(tile.pdf_y1 * layout_zoom_factor)
+
+        for region in regions:
+            if region.region_type != "table":
+                continue
+
+            rx0, ry0, rx1, ry1 = region.bbox
+
+            # Check for overlap
+            if not (tile_x1 < rx0 or tile_x0 > rx1 or tile_y1 < ry0 or tile_y0 > ry1):
+                return True
+
+        return False
+
+    # Calculate layout zoom factor for coordinate conversion
+    layout_zoom_factor = layout_dpi / 72.0
+
     # Process each tile with all PSM modes (Tesseract) or single pass (EasyOCR)
     for tile in tiles:
         tile_all_results: List[Dict[str, Any]] = []
 
+        # Determine DPI and preprocessing for this tile based on layout
+        tile_dpi = dpi
+        tile_upscale = upscale_factor if enable_upscaling else 1.0
+
+        if enable_layout_detection and tile_overlaps_table(tile, layout_regions, layout_zoom_factor):
+            # Boost DPI for table regions - tables contain critical data
+            tile_dpi = int(dpi * table_dpi_boost)
+            import sys
+            print(f"[Layout] Tile {tile.tile_id} overlaps table → DPI boosted to {tile_dpi} (base={dpi}, boost={table_dpi_boost}x)", file=sys.stderr)
+
+        # Recalculate zoom if DPI changed
+        tile_zoom = tile_dpi / 72.0
+
         if engine == "easyocr":
             # EasyOCR doesn't have PSM modes, just run once
             ocr_config = HighResOCRConfig(
-                dpi=dpi,
+                dpi=tile_dpi,
                 psm=psm,
                 min_conf=min_conf,
                 lang=lang,
                 engine=engine,
-                use_gpu=use_gpu
+                use_gpu=use_gpu,
+                upscale_factor=tile_upscale,
+                enable_sharpening=enable_upscaling,
+                qwen_prompt_mode=qwen_prompt_mode,
             )
 
             tile_results = process_single_tile(
                 pdf_path=pdf_path,
                 page_index=page_index,
                 tile_bounds=tile,
-                zoom=zoom,
+                zoom=tile_zoom,  # Use boosted zoom if DPI changed
                 ocr_config=ocr_config,
                 skip_empty=skip_empty,
                 min_content_pct=min_content_pct,
@@ -930,19 +1144,22 @@ def tiled_ocr(
             # Tesseract with optional dual-PSM mode
             for psm_mode in psm_modes:
                 ocr_config = HighResOCRConfig(
-                    dpi=dpi,
+                    dpi=tile_dpi,
                     psm=psm_mode,
                     min_conf=min_conf,
                     lang=lang,
                     engine=engine,
-                    use_gpu=use_gpu
+                    use_gpu=use_gpu,
+                    upscale_factor=tile_upscale,
+                    enable_sharpening=enable_upscaling,
+                    qwen_prompt_mode=qwen_prompt_mode,
                 )
 
                 tile_results = process_single_tile(
                     pdf_path=pdf_path,
                     page_index=page_index,
                     tile_bounds=tile,
-                    zoom=zoom,
+                    zoom=tile_zoom,  # Use boosted zoom if DPI changed
                     ocr_config=ocr_config,
                     skip_empty=skip_empty,
                     min_content_pct=min_content_pct,
@@ -995,18 +1212,7 @@ def tiled_ocr(
         DEBUG_DPI = 150  # Much lower than OCR DPI, but sufficient for visualization
         gray_full, zoom_full = _render_page_gray(pdf_path, page_index, DEBUG_DPI)
 
-        # Convert results to pixel coordinates for visualization
-        results_px = []
-        for r in deduplicated_results:
-            pdf_bbox = r["bbox"]
-            px_bbox = [v * zoom_full for v in pdf_bbox]
-            results_px.append({
-                "text": r["text"],
-                "bbox": px_bbox,
-                "conf": r.get("conf", 0)
-            })
-
-        # Save debug stages
+        # Save initial stages
         debug_visualizer.save_original(gray_full, DEBUG_DPI)
         debug_visualizer.save_grayscale(gray_full)
 
@@ -1025,11 +1231,14 @@ def tiled_ocr(
         processed_mask = np.array(tile_processed_flags, dtype=bool)
         debug_visualizer.save_tiles(gray_full, tile_viz_data, processed_mask)
 
-        # Save detection results
-        debug_visualizer.save_detections(gray_full, results_px)
-        debug_visualizer.save_final_with_text(gray_full, results_px)
-        debug_visualizer.save_confidence_heatmap(gray_full.shape[1], gray_full.shape[0], results_px)
-        debug_visualizer.generate_summary_report(deduplicated_results, processing_time)
+        _emit_debug_visuals(
+            debug_visualizer,
+            gray_full,
+            deduplicated_results,
+            zoom_full,
+            include_initial=False,
+            processing_time=processing_time,
+        )
 
     if return_report:
         return deduplicated_results, report

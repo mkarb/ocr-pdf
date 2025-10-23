@@ -38,6 +38,12 @@ except ImportError:
     HAVE_CLIENT = False
     logger.warning("vLLM client not available")
 
+try:
+    from .qwen_prompts import get_prompt, DEFAULT_PROMPT_MODE
+except ImportError:  # pragma: no cover
+    get_prompt = None  # type: ignore
+    DEFAULT_PROMPT_MODE = "sparse"
+    logger.warning("Qwen prompt presets not available; using sparse mode only")
 
 class QwenVLOCRClient:
     """
@@ -68,6 +74,7 @@ class QwenVLOCRClient:
         self,
         image: np.ndarray,
         focus_technical: bool = True,
+        prompt_mode: str = DEFAULT_PROMPT_MODE,
     ) -> List[Dict[str, Any]]:
         """
         Extract text from image using vLLM service.
@@ -89,12 +96,24 @@ class QwenVLOCRClient:
         image_h, image_w = image.shape[:2]
 
         # Call vLLM service
+        prompt = None
+        if get_prompt is not None:
+            try:
+                prompt = get_prompt(prompt_mode)
+            except ValueError as exc:
+                logger.warning("Invalid prompt mode '%s': %s. Falling back to '%s'.",
+                               prompt_mode, exc, DEFAULT_PROMPT_MODE)
+                prompt = get_prompt(DEFAULT_PROMPT_MODE)
+        else:
+            prompt = None
+
         results = self.client.ocr_image_to_pdf_coords(
             image=image,
             image_width=image_w,
             image_height=image_h,
             focus_technical=focus_technical,
-            min_confidence=0.5
+            min_confidence=0.5,
+            prompt=prompt,
         )
 
         # Add source tag
@@ -110,6 +129,7 @@ class QwenVLOCRClient:
         tile_bbox: Tuple[float, float, float, float],
         page_width: float,
         page_height: float,
+        prompt_mode: str = DEFAULT_PROMPT_MODE,
     ) -> List[Dict[str, Any]]:
         """
         Extract text from tile and map to PDF coordinates.
@@ -128,7 +148,8 @@ class QwenVLOCRClient:
         # Extract from tile
         tile_results = self.extract_text_from_image(
             tile_image,
-            focus_technical=True
+            focus_technical=True,
+            prompt_mode=prompt_mode,
         )
 
         # Map tile-local coords to PDF coords
