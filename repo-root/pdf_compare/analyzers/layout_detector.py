@@ -86,7 +86,6 @@ class LayoutDetector:
 
         # Find contours
         contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
         # Get image dimensions for maximum size filtering
         img_height, img_width = gray.shape
         max_width = int(img_width * self.max_region_pct)
@@ -157,6 +156,11 @@ class LayoutDetector:
         # Find contours
         contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        img_height, img_width = gray.shape
+        max_width = int(img_width * self.max_region_pct)
+        max_height = int(img_height * self.max_region_pct)
+        max_area = img_width * img_height * self.max_region_pct
+
         diagram_regions = []
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
@@ -165,10 +169,18 @@ class LayoutDetector:
             if w < self.min_diagram_size or h < self.min_diagram_size:
                 continue
 
-            # Calculate shape complexity
-            area = cv2.contourArea(contour)
-            perimeter = cv2.arcLength(contour, True)
+            if w > max_width or h > max_height:
+                if self.debug:
+                    print("LayoutDetector skipping oversized diagram region %dx%d (max %dx%d)" % (w, h, max_width, max_height))
+                continue
 
+            area = cv2.contourArea(contour)
+            if area <= 0 or area > max_area:
+                if self.debug and area > max_area:
+                    print("LayoutDetector skipping high-area diagram region %.0f > %.0f" % (area, max_area))
+                continue
+
+            perimeter = cv2.arcLength(contour, True)
             if perimeter == 0:
                 continue
 
@@ -184,7 +196,7 @@ class LayoutDetector:
                 confidence = min(90, 50 + complexity * 5)
 
                 diagram_regions.append(LayoutRegion(
-                    bbox=(x, y, x+w, y+h),
+                    bbox=(x, y, x + w, y + h),
                     region_type="diagram",
                     confidence=confidence,
                     metadata={

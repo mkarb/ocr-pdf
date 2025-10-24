@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict
 
 import streamlit as st
 
-DEFAULT_OCR_DEBUG_DIR = "./debug/ocr"
+_DEFAULT_DATA_ROOT = Path(os.getenv("APP_DATA_DIR", Path.cwd() / "data"))
+DEFAULT_OCR_DEBUG_DIR = str((_DEFAULT_DATA_ROOT / "outputs" / "ocr-debug").absolute())
 DEFAULT_OCR_DEBUG_CONFIG: Dict[str, Any] = {
     "enabled": False,
     "output_dir": DEFAULT_OCR_DEBUG_DIR,
@@ -43,6 +45,12 @@ def update_ocr_debug_session(
     """Persist OCR debug configuration in Streamlit session_state."""
     config = _build_config(enabled, output_dir, low_threshold, high_threshold)
     st.session_state["ocr_debug_config"] = config
+    if config["enabled"]:
+        try:
+            Path(config["output_dir"]).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Directory creation failures are surfaced later when we try to write
+            pass
     return config
 
 
@@ -60,5 +68,5 @@ def get_ocr_debug_config() -> Dict[str, Any]:
 
 def resolve_debug_output_dir(config: Dict[str, Any]) -> Path:
     """Return a Path object for the debug output directory."""
-    return Path(config.get("output_dir") or DEFAULT_OCR_DEBUG_DIR)
-
+    raw_dir = config.get("output_dir") or DEFAULT_OCR_DEBUG_DIR
+    return Path(raw_dir).expanduser()

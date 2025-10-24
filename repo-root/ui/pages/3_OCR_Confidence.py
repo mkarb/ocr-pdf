@@ -231,13 +231,14 @@ with col2:
 
                 # Download button for selected image
                 with open(image_path, "rb") as file:
-                    st.download_button(
-                        label="Download This Image",
-                        data=file,
-                        file_name=Path(image_path).name,
-                        mime="image/png",
-                        use_container_width=True
-                    )
+                    image_bytes = file.read()
+                st.download_button(
+                    label="Download This Image",
+                    data=image_bytes,
+                    file_name=Path(image_path).name,
+                    mime="image/png",
+                    use_container_width=True
+                )
 
             # Download all debug images for this page
             st.divider()

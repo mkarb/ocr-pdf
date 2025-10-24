@@ -33,10 +33,20 @@ from .analyzers.qwen_prompts import DEFAULT_PROMPT_MODE as DEFAULT_QWEN_PROMPT_M
 DEFAULT_ROTATIONS = {0, 90, 180, 270}
 
 # Sensible defaults (can be overridden via pdf_to_vectormap args)
-DEF_MIN_SEGMENT_LEN = 0.50     # drop ultra-short stroke segments (< 0.5 user units)
-DEF_MIN_FILL_AREA   = 0.50     # drop tiny filled rects (< 0.5 sq units)
+DEF_MIN_SEGMENT_LEN = 0.2     # drop ultra-short stroke segments (< 0.5 user units)
+DEF_MIN_FILL_AREA   = 0.2     # drop tiny filled rects (< 0.5 sq units)
 DEF_BEZIER_SAMPLES  = 24       # samples per cubic segment (higher = smoother)
 DEF_SIMPLIFY_TOL    = None     # e.g., 0.05..0.15 to reduce oversampled paths
+
+
+def _default_debug_output_dir() -> str:
+    """Resolve default OCR debug output directory."""
+    env_override = os.getenv("OCR_DEBUG_OUTPUT_DIR")
+    if env_override:
+        return os.path.expanduser(env_override)
+
+    base_dir = Path(os.getenv("APP_DATA_DIR", Path.cwd() / "data"))
+    return str((base_dir / "outputs" / "ocr-debug").absolute())
 
 # Worker configuration (managed by worker_pool module)
 # See worker_pool.get_optimal_workers() for dynamic worker allocation
@@ -143,8 +153,8 @@ def _extract_text(
     ocr_engine: str = "easyocr",
     debug_ocr: bool = False,
     debug_output_dir: Optional[str] = None,
-    debug_conf_low: int = 70,
-    debug_conf_high: int = 90,
+    debug_conf_low: int = 65,
+    debug_conf_high: int = 92,
     enable_layout_detection: bool = False,
     table_dpi_boost: float = 1.5,
     enable_upscaling: bool = False,
@@ -189,14 +199,18 @@ def _extract_text(
     # Run OCR if enabled and little native text was found
     if enable_ocr and len(runs) < 20 and pdf_path and page_index is not None:
         try:
-            from .analyzers import highres_ocr, tiled_ocr, HighResOCRConfig
+            from .analyzers import HighResOCRConfig, TiledOCRDebugContext, highres_ocr, tiled_ocr
 
             # Create debug visualizer if requested
             debug_visualizer = None
             if debug_ocr:
                 try:
                     from .debug import create_visualizer
-                    debug_output_dir_final = debug_output_dir or "./debug/ocr"
+                    debug_output_dir_final = (
+                        os.path.expanduser(debug_output_dir)
+                        if debug_output_dir
+                        else _default_debug_output_dir()
+                    )
                     debug_visualizer = create_visualizer(
                         enabled=True,
                         output_dir=debug_output_dir_final,
@@ -232,6 +246,7 @@ def _extract_text(
                 print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using tiled OCR at {dpi} DPI (page too large for single tile)", file=sys.stderr)
 
                 min_conf_threshold = 50  # Lowered from 60 to capture more text (some may be lower confidence)
+                debug_context = TiledOCRDebugContext(debug_visualizer)
                 ocr_results, report = tiled_ocr(
                     pdf_path=pdf_path,
                     page_index=page_index,
@@ -239,13 +254,13 @@ def _extract_text(
                     psm=11,
                     min_conf=min_conf_threshold,
                     overlap_pct=0.35,  # Increased from 0.20 to better capture text at boundaries
-                    skip_empty=True,
-                    max_workers=1,  # Serial in Streamlit
+                    skip_empty=False,
+                    max_workers=1,  # Auto-calculated in tiled_ocr (will use optimal workers for Tesseract/EasyOCR)
                     return_report=True,
                     use_dual_psm=True,  # Use both PSM 11 and PSM 6 for better text capture (Tesseract only)
                     engine=ocr_engine,  # Use user-selected OCR engine
                     use_gpu=True,       # Enable GPU acceleration
-                    debug_visualizer=debug_visualizer,  # Pass debug visualizer
+                    debug_visualizer=debug_context,
                     enable_layout_detection=enable_layout_detection,
                     table_dpi_boost=table_dpi_boost,
                     enable_upscaling=enable_upscaling,
@@ -462,7 +477,7 @@ def pdf_to_vectormap(
     - enable_ocr: if True, runs OCR on pages with minimal native text
     - ocr_engine: OCR engine to use - "tesseract", "easyocr", or "qwen-vl"
     - debug_ocr: if True, outputs visual debugging images at each OCR stage
-    - debug_output_dir: directory to save debug images (default: ./debug/ocr)
+    - debug_output_dir: directory to save debug images (default: APP_DATA_DIR/outputs/ocr-debug)
     - debug_conf_low: low confidence threshold for visualization (default: 70)
     - debug_conf_high: high confidence threshold for visualization (default: 90)
     - enable_layout_detection: enable layout-aware heuristics (tables/diagrams)
