@@ -20,6 +20,7 @@ from .analyzers.table_extractor import (
     Table,
     TableExtractionConfig,
     TableExtractor,
+    tables_to_csv_string,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -101,12 +102,17 @@ def extract_tables(
     vectormap: Optional[object] = None,
     regenerate_vectormap: bool = True,
     workers: int = 1,
+    csv_output_dir: Optional[str | Path] = None,
+    combined_csv_path: Optional[str | Path] = None,
 ) -> List[Table]:
     """
     Extract tables for a document using ``TableExtractor``.
 
     Parameters mirror :func:`ensure_vectormap`; callers typically pass the values
-    collected from the user interface.
+    collected from the user interface. When ``csv_output_dir`` is supplied the
+    extracted tables are also persisted as individual CSV files. Supplying
+    ``combined_csv_path`` writes all detected tables to a single combined CSV
+    (with table metadata columns) for downstream processing.
     """
     normalized_pages = _coerce_page_numbers(page_numbers)
     resolved_path = str(Path(doc_path))
@@ -126,11 +132,22 @@ def extract_tables(
     if normalized_pages is not None:
         page_indices = [page - 1 for page in normalized_pages]
 
-    return extractor.extract_all_tables(
+    tables = extractor.extract_all_tables(
         resolved_path,
         page_indices=page_indices,
         vector_map=vectormap,
     )
+
+    if csv_output_dir:
+        extractor.save_tables_csv(str(csv_output_dir))
+
+    if combined_csv_path:
+        csv_data = tables_to_csv_string(tables)
+        combined_path = Path(combined_csv_path)
+        combined_path.parent.mkdir(parents=True, exist_ok=True)
+        combined_path.write_text(csv_data, encoding="utf-8")
+
+    return tables
 
 
 def extract_bom_tables(
@@ -143,6 +160,8 @@ def extract_bom_tables(
     vectormap: Optional[object] = None,
     regenerate_vectormap: bool = True,
     workers: int = 1,
+    csv_output_dir: Optional[str | Path] = None,
+    combined_csv_path: Optional[str | Path] = None,
 ) -> List[Table]:
     """Convenience wrapper that filters :func:`extract_tables` results to BOM tables."""
     tables = extract_tables(
@@ -154,6 +173,8 @@ def extract_bom_tables(
         vectormap=vectormap,
         regenerate_vectormap=regenerate_vectormap,
         workers=workers,
+        csv_output_dir=csv_output_dir,
+        combined_csv_path=combined_csv_path,
     )
     return [table for table in tables if table.table_type == "bom"]
 

@@ -10,6 +10,14 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 import cv2
 
+# Import shared visualization utilities
+from .visualization_utils import (
+    draw_bbox_with_label,
+    draw_region_borders,
+    draw_tile_grid,
+    draw_tile_grid_with_regions,
+)
+
 try:
     import matplotlib
     matplotlib.use('Agg')  # Non-interactive backend
@@ -151,7 +159,6 @@ class OCRVisualizer:
         for det in sorted_detections:
             bbox = det["bbox"]
             conf = det.get("conf", 0)
-            text = det.get("text", "")
 
             # Color coding based on confidence
             if conf >= self.config.confidence_threshold_high:
@@ -161,19 +168,15 @@ class OCRVisualizer:
             else:
                 color = (0, 0, 255)  # Red: low confidence
 
-            # Draw bounding box
-            x0, y0, x1, y1 = [int(v) for v in bbox]
-            cv2.rectangle(img_color, (x0, y0), (x1, y1), color, 2)
-
-            # Draw confidence label
-            label = f"{conf}%"
-            label_bg_color = tuple(int(c * 0.7) for c in color)
-            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
-                                                      self.config.font_scale, 1)
-            cv2.rectangle(img_color, (x0, y0 - label_h - 5),
-                         (x0 + label_w + 5, y0), label_bg_color, -1)
-            cv2.putText(img_color, label, (x0 + 2, y0 - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, self.config.font_scale, (255, 255, 255), 1)
+            draw_bbox_with_label(
+                img_color,
+                bbox,
+                f"{conf}%",
+                color,
+                thickness=2,
+                font_scale=self.config.font_scale,
+                draw_filled_label=True,
+            )
 
         # Add legend
         legend_y = 30
@@ -196,11 +199,11 @@ class OCRVisualizer:
 
     def save_tiles(self, image: np.ndarray, tiles: List[Dict], processed_mask: np.ndarray):
         """
-        Stage 5: Save tile grid visualization.
+        Stage 5: Save tile grid visualization with borders.
 
         Args:
             image: Full page image
-            tiles: List of tile bounds with metadata
+            tiles: List of tile bounds with metadata (can have either 'bbox' or 'px0/py0/px1/py1')
             processed_mask: Boolean mask of which tiles were processed
         """
         if not self.config.enabled or not self.config.save_tiles:
@@ -208,55 +211,46 @@ class OCRVisualizer:
 
         output_path = self._get_output_path("tiles")
 
-        if len(image.shape) == 2:
-            img_color = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        else:
-            img_color = image.copy()
-
-        # Overlay semi-transparent grid
-        overlay = img_color.copy()
-
+        # Convert tile data to format expected by visualization utility
+        tile_vis_data = []
         for i, tile in enumerate(tiles):
-            x0, y0, x1, y1 = tile["px0"], tile["py0"], tile["px1"], tile["py1"]
-
-            if processed_mask[i]:
-                # Processed tile: blue
-                color = (255, 100, 0)
-                thickness = 2
+            # Handle both bbox format and px0/py0/px1/py1 format
+            if "bbox" in tile:
+                bbox = tile["bbox"]
             else:
-                # Skipped tile: gray
-                color = (128, 128, 128)
-                thickness = 1
+                bbox = (tile["px0"], tile["py0"], tile["px1"], tile["py1"])
 
-            cv2.rectangle(overlay, (x0, y0), (x1, y1), color, thickness)
+            tile_vis_data.append({
+                "bbox": bbox,
+                "tile_id": tile.get("tile_id", f"{i}"),
+                "has_content": bool(processed_mask[i])
+            })
 
-            # Draw tile ID
-            tile_id = tile.get("tile_id", f"{i}")
-            cv2.putText(overlay, tile_id, (x0 + 5, y0 + 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        # Use shared visualization utility
+        img_with_tiles = draw_tile_grid(
+            image, tile_vis_data,
+            show_labels=True,
+            show_processed_only=False
+        )
 
-        # Blend overlay
-        cv2.addWeighted(overlay, self.config.overlay_alpha, img_color,
-                       1 - self.config.overlay_alpha, 0, img_color)
-
-        # Add stats
+        # Add stats overlay
         total_tiles = len(tiles)
         processed_tiles = int(processed_mask.sum())
         skipped_tiles = total_tiles - processed_tiles
 
         stats_text = [
             f"Total Tiles: {total_tiles}",
-            f"Processed: {processed_tiles}",
-            f"Skipped: {skipped_tiles}",
+            f"Processed: {processed_tiles} (green)",
+            f"Skipped: {skipped_tiles} (gray)",
         ]
 
         y_offset = 30
         for text in stats_text:
-            cv2.putText(img_color, text, (10, y_offset),
+            cv2.putText(img_with_tiles, text, (10, y_offset),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             y_offset += 30
 
-        self._write_image(output_path, img_color, "tile grid overlay")
+        self._write_image(output_path, img_with_tiles, "tile grid with borders")
 
     def save_final_with_text(self, image: np.ndarray, results: List[Dict]):
         """
@@ -451,80 +445,14 @@ Low Confidence Texts (< {self.config.confidence_threshold_low}%):
 
         output_path = self._get_output_path("layout_regions")
 
-        # Convert to BGR for colored overlays
-        if len(image.shape) == 2:
-            img_color = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        else:
-            img_color = image.copy()
+        # Use shared visualization utility
+        img_with_regions = draw_region_borders(
+            image, regions,
+            show_labels=True,
+            show_legend=True
+        )
 
-        # Color map for region types
-        colors = {
-            "table": (0, 255, 0),      # Green
-            "diagram": (255, 0, 0),    # Blue
-            "text": (0, 165, 255),     # Orange
-            "mixed": (255, 255, 0)     # Cyan
-        }
-
-        # Draw each region
-        for region in regions:
-            # Handle both LayoutRegion objects and dicts
-            if hasattr(region, 'bbox'):
-                bbox = region.bbox
-                region_type = region.region_type
-                confidence = region.confidence
-            else:
-                bbox = region.get("bbox", (0, 0, 0, 0))
-                region_type = region.get("region_type", "mixed")
-                confidence = region.get("confidence", 0)
-
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            color = colors.get(region_type, (128, 128, 128))
-
-            # Draw bounding box
-            cv2.rectangle(img_color, (x1, y1), (x2, y2), color, 3)
-
-            # Draw label
-            label = f"{region_type} {confidence:.0f}%"
-            font_scale = 0.8
-            thickness = 2
-            (label_w, label_h), baseline = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
-            )
-
-            # Background for label
-            cv2.rectangle(
-                img_color,
-                (x1, y1 - label_h - baseline - 5),
-                (x1 + label_w + 5, y1),
-                color,
-                -1
-            )
-
-            # Label text
-            cv2.putText(
-                img_color, label, (x1 + 2, y1 - baseline - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness
-            )
-
-        # Add legend
-        legend_y = 30
-        legend_x = 10
-        cv2.rectangle(img_color, (legend_x - 5, 5), (legend_x + 350, legend_y + 90), (255, 255, 255), -1)
-        cv2.rectangle(img_color, (legend_x - 5, 5), (legend_x + 350, legend_y + 90), (0, 0, 0), 2)
-
-        cv2.putText(img_color, "Layout Regions:", (legend_x, legend_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-        legend_y += 25
-        cv2.putText(img_color, "Green = Table | Blue = Diagram", (legend_x, legend_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
-        legend_y += 20
-        cv2.putText(img_color, "Orange = Text | Cyan = Mixed", (legend_x, legend_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
-        legend_y += 20
-        cv2.putText(img_color, f"Total Regions: {len(regions)}", (legend_x, legend_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
-
-        self._write_image(output_path, img_color, "layout regions")
+        self._write_image(output_path, img_with_regions, "layout regions")
 
 
 # Convenience function for integration

@@ -15,7 +15,11 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 from .db_backend import DatabaseBackend
 from .table_extractor import extract_tables
-from .analyzers.table_extractor import Table, TableExtractionConfig
+from .analyzers.table_extractor import (
+    Table,
+    TableExtractionConfig,
+    tables_to_csv_string,
+)
 
 
 DEFAULT_BOM_KEYWORDS = [
@@ -84,6 +88,8 @@ def run_quick_bom_extraction(
     *,
     dpi: int,
     page_numbers: Sequence[int],
+    csv_output_dir: Optional[Path] = None,
+    combined_csv_path: Optional[Path] = None,
 ) -> BOMExtractionResult:
     """
     Run BOM extraction for the selected pages and return both BOM tables and
@@ -104,6 +110,8 @@ def run_quick_bom_extraction(
         config,
         page_numbers=page_numbers,
         workers=1,
+        csv_output_dir=csv_output_dir,
+        combined_csv_path=combined_csv_path,
     )
 
     bom_tables = [table for table in tables if table.table_type == "bom"]
@@ -127,6 +135,8 @@ def run_table_extraction(
     dpi: int,
     ocr_min_conf: int,
     page_numbers: Optional[Sequence[int]],
+    csv_output_dir: Optional[Path] = None,
+    combined_csv_path: Optional[Path] = None,
 ) -> List[Table]:
     """Perform configurable table extraction for the Advanced workflow."""
     config = TableExtractionConfig(
@@ -141,6 +151,8 @@ def run_table_extraction(
         config,
         page_numbers=page_numbers,
         workers=1,
+        csv_output_dir=csv_output_dir,
+        combined_csv_path=combined_csv_path,
     )
 
 
@@ -159,24 +171,7 @@ def summarise_tables(tables: Iterable[Table]) -> Dict[str, List]:
 
 def tables_to_csv(tables: Sequence[Table]) -> str:
     """Convert tables into a combined CSV string suitable for download."""
-    try:
-        import pandas as pd
-    except ImportError as exc:  # pragma: no cover - runtime dependency
-        raise ImportError("pandas is required for CSV export.") from exc
-
-    frames = []
-    for table in tables:
-        df = table.to_dataframe()
-        df.insert(0, "Table ID", table.table_id)
-        df.insert(1, "Table Type", table.table_type)
-        df.insert(2, "Page", table.page)
-        frames.append(df)
-
-    if not frames:
-        return ""
-
-    combined = pd.concat(frames, ignore_index=True)
-    return combined.to_csv(index=False)
+    return tables_to_csv_string(tables)
 
 
 __all__ = [

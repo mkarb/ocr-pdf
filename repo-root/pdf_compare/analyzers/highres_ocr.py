@@ -53,6 +53,10 @@ except ImportError:
 
 from .qwen_prompts import DEFAULT_PROMPT_MODE as DEFAULT_QWEN_PROMPT_MODE
 
+# Qwen2-VL tiling thresholds
+QWEN_VL_MAX_SIDE = 1024  # Vision model accepts up to 4K per side
+QWEN_VL_SUBTILE_OVERLAP_RATIO = 0.12  # 8% overlap to keep context on seams
+
 BBox = Tuple[float, float, float, float]  # x0,y0,x1,y1 in PDF user space
 
 @dataclass(frozen=True)
@@ -128,6 +132,12 @@ class TileOCRReport:
     grid_size: Tuple[int, int]
     dpi_used: int
     overlap_pct: float
+    avg_confidence: float = 0.0
+    median_confidence: float = 0.0
+    min_confidence: int = 0
+    max_confidence: int = 0
+    low_confidence_results: int = 0
+    engine_counts: Dict[str, int] = field(default_factory=dict)
 
 def _render_page_gray(pdf_path: str, page_index: int, dpi: int) -> tuple[np.ndarray, float]:
     """Return grayscale image and zoom factor for a page at given DPI."""
@@ -304,18 +314,45 @@ def _ocr_tile_tesseract(gray: np.ndarray, cfg: HighResOCRConfig, upscale_factor:
     else:
         actual_scale = 1.0
 
-    # Enhanced preprocessing for engineering drawings
+    # Enhanced preprocessing for engineering drawings (shaded tables, dense grids)
     # 1. Denoise with bilateral filter (preserves edges better than Gaussian)
-    proc = cv2.bilateralFilter(gray, 9, 75, 75)
+    base = cv2.bilateralFilter(gray, 9, 75, 75)
 
-    # 2. Adaptive thresholding for varying lighting/contrast
+    # 2. Remove soft background shading that often appears in table columns
+    background = cv2.medianBlur(base, 21)
+    shade_removed = cv2.absdiff(base, background)
+    shade_removed = cv2.normalize(shade_removed, None, 0, 255, cv2.NORM_MINMAX)
+
+    # 3. Adaptive thresholding with dynamic window size (larger windows for wide cells)
+    min_dim = min(shade_removed.shape[:2])
+    if min_dim > 600:
+        block_size = 41
+    elif min_dim > 400:
+        block_size = 31
+    elif min_dim > 200:
+        block_size = 21
+    else:
+        block_size = 11
+    if block_size % 2 == 0:
+        block_size += 1  # Block size must be odd
+
     proc = cv2.adaptiveThreshold(
-        proc, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2
+        shade_removed,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        block_size,
+        2,
     )
 
-    # 3. Morphological operations to clean up thin lines and connect broken characters
-    kernel = np.ones((2,2), np.uint8)
+    # 4. Remove vertical ruling lines that confuse OCR confidences
+    vertical_kernel_len = max(3, int(proc.shape[0] * 0.05))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vertical_kernel_len))
+    vertical_lines = cv2.morphologyEx(proc, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+    proc = cv2.subtract(proc, vertical_lines)
+
+    # 5. Morphological close to reconnect characters broken by previous steps
+    kernel = np.ones((2, 2), np.uint8)
     proc = cv2.morphologyEx(proc, cv2.MORPH_CLOSE, kernel)
 
     # Use image_to_data to get boxes + confidences
@@ -347,12 +384,8 @@ def _ocr_tile_tesseract(gray: np.ndarray, cfg: HighResOCRConfig, upscale_factor:
     return out
 
 
-def _ocr_tile_qwen_vl(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
-    """
-    Run Qwen2-VL on a grayscale tile via vLLM microservice.
-    Returns list of dicts: {"text": str, "bbox": (x0,y0,x1,y1), "conf": int}
-    (bbox is in TILE pixel coords; caller maps to PDF coords)
-    """
+def _qwen_vl_client() -> Any:
+    """Ensure the Qwen2-VL client is initialized and available."""
     global _QWEN_VL_OCR
 
     if not HAVE_QWEN_VL:
@@ -360,30 +393,34 @@ def _ocr_tile_qwen_vl(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
 
     if _QWEN_VL_OCR is None:
         import sys
-        print(f"OCR: Connecting to vLLM service for Qwen2-VL OCR...", file=sys.stderr)
+        print("OCR: Connecting to vLLM service for Qwen2-VL OCR...", file=sys.stderr)
         _QWEN_VL_OCR = get_qwen_vl_ocr_client()
 
-        # Check if service is available
         if not _QWEN_VL_OCR.is_available():
-            print(f"OCR: WARNING - vLLM service not available, will fallback to EasyOCR/Tesseract", file=sys.stderr)
+            print("OCR: WARNING - vLLM service not available, will fallback to EasyOCR/Tesseract", file=sys.stderr)
             raise VLLMServiceUnavailable("vLLM service not available")
 
-        print(f"OCR: Connected to vLLM service", file=sys.stderr)
+        print("OCR: Connected to vLLM service", file=sys.stderr)
 
-    # Extract text using VLM service (sends HTTP request)
+    return _QWEN_VL_OCR
+
+
+def _ocr_tile_qwen_vl_base(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
+    """Call the Qwen2-VL service for a tile guaranteed to be within size limits."""
+    client = _qwen_vl_client()
+
     try:
-        results = _QWEN_VL_OCR.extract_text_from_image(
+        results = client.extract_text_from_image(
             gray,
             focus_technical=True,
             prompt_mode=cfg.qwen_prompt_mode,
         )
     except VLLMServiceUnavailable:
         import sys
-        print(f"OCR: vLLM service unavailable, fallback required", file=sys.stderr)
-        raise  # Will cause fallback to EasyOCR/Tesseract in caller
+        print("OCR: vLLM service unavailable, fallback required", file=sys.stderr)
+        raise
 
-    # Convert to standard format
-    out = []
+    out: List[Dict[str, Any]] = []
     for item in results:
         conf = int(item.get("confidence", 1.0) * 100)
         if conf < cfg.min_conf:
@@ -397,6 +434,63 @@ def _ocr_tile_qwen_vl(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
         })
 
     return out
+
+
+def _qwen_generate_slices(length: int) -> List[Tuple[int, int]]:
+    """Create overlapping slices that keep segment length within the Qwen limit."""
+    if length <= QWEN_VL_MAX_SIDE:
+        return [(0, length)]
+
+    overlap = max(32, int(QWEN_VL_MAX_SIDE * QWEN_VL_SUBTILE_OVERLAP_RATIO))
+    step = max(1, QWEN_VL_MAX_SIDE - overlap)
+
+    slices: List[Tuple[int, int]] = []
+    start = 0
+    while start < length:
+        end = min(length, start + QWEN_VL_MAX_SIDE)
+        slices.append((start, end))
+        if end >= length:
+            break
+        start = end - overlap
+
+    return slices
+
+
+def _ocr_tile_qwen_vl(gray: np.ndarray, cfg: HighResOCRConfig, *, _depth: int = 0) -> List[Dict]:
+    """
+    Run Qwen2-VL on a grayscale tile via vLLM microservice.
+    Automatically sub-tiles oversized inputs so we maintain high DPI without exceeding
+    the 4K vision-model limit.
+    """
+    height, width = gray.shape[:2]
+    max_dim = max(height, width)
+
+    if max_dim <= QWEN_VL_MAX_SIDE:
+        return _ocr_tile_qwen_vl_base(gray, cfg)
+
+    # Subdivide oversized tiles with overlap to preserve context
+    y_slices = _qwen_generate_slices(height)
+    x_slices = _qwen_generate_slices(width)
+    aggregated: List[Dict[str, Any]] = []
+
+    for y0, y1 in y_slices:
+        for x0, x1 in x_slices:
+            sub_gray = gray[y0:y1, x0:x1]
+            sub_results = _ocr_tile_qwen_vl(sub_gray, cfg, _depth=_depth + 1)
+            for item in sub_results:
+                x_start, y_start, x_end, y_end = item["bbox"]
+                aggregated.append({
+                    **item,
+                    "bbox": (
+                        x_start + x0,
+                        y_start + y0,
+                        x_end + x0,
+                        y_end + y0,
+                    ),
+                })
+
+    # Deduplicate overlaps introduced by sub-tiling
+    return merge_and_deduplicate(aggregated)
 
 
 def _ocr_tile(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
@@ -462,15 +556,45 @@ def highres_ocr(
 
     # STAGE 3: Preprocessing (for Tesseract, show preprocessing steps)
     if cfg.engine == "tesseract" and debug_visualizer:
-        proc = cv2.bilateralFilter(gray, 9, 75, 75)
-        proc = cv2.adaptiveThreshold(proc, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                      cv2.THRESH_BINARY, 11, 2)
-        kernel = np.ones((2,2), np.uint8)
+        base = cv2.bilateralFilter(gray, 9, 75, 75)
+        background = cv2.medianBlur(base, 21)
+        shade_removed = cv2.absdiff(base, background)
+        shade_removed = cv2.normalize(shade_removed, None, 0, 255, cv2.NORM_MINMAX)
+
+        min_dim = min(shade_removed.shape[:2])
+        if min_dim > 600:
+            block_size = 41
+        elif min_dim > 400:
+            block_size = 31
+        elif min_dim > 200:
+            block_size = 21
+        else:
+            block_size = 11
+        if block_size % 2 == 0:
+            block_size += 1
+
+        proc = cv2.adaptiveThreshold(
+            shade_removed,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            block_size,
+            2,
+        )
+
+        vertical_kernel_len = max(3, int(proc.shape[0] * 0.05))
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vertical_kernel_len))
+        vertical_lines = cv2.morphologyEx(proc, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+        proc = cv2.subtract(proc, vertical_lines)
+
+        kernel = np.ones((2, 2), np.uint8)
         proc = cv2.morphologyEx(proc, cv2.MORPH_CLOSE, kernel)
 
         preprocessing_info.update({
             "bilateral_filter": "9x9, sigma=75",
-            "adaptive_threshold": "Gaussian, block=11",
+            "background_removal": "median 21x21",
+            "adaptive_threshold": f"Gaussian, block={block_size}",
+            "vertical_line_removal": f"open kernel=(1,{vertical_kernel_len})",
             "morphology": "Close, 2x2 kernel"
         })
 
@@ -1193,6 +1317,30 @@ def tiled_ocr(
 
     processing_time = time.time() - start_time
 
+    # Confidence/engine statistics
+    confidences = [
+        int(r.get("conf", 0))
+        for r in deduplicated_results
+        if r.get("conf") is not None
+    ]
+    if confidences:
+        avg_confidence = float(np.mean(confidences))
+        median_confidence = float(np.median(confidences))
+        min_confidence_val = int(np.min(confidences))
+        max_confidence_val = int(np.max(confidences))
+        low_confidence_results = sum(1 for c in confidences if c < min_conf)
+    else:
+        avg_confidence = 0.0
+        median_confidence = 0.0
+        min_confidence_val = 0
+        max_confidence_val = 0
+        low_confidence_results = 0
+
+    engine_counts: Dict[str, int] = {}
+    for r in deduplicated_results:
+        engine_id = r.get("source") or "ocr"
+        engine_counts[engine_id] = engine_counts.get(engine_id, 0) + 1
+
     # Create report
     report = TileOCRReport(
         total_tiles=len(tiles),
@@ -1203,7 +1351,13 @@ def tiled_ocr(
         processing_time=processing_time,
         grid_size=(config.rows, config.cols),
         dpi_used=dpi,
-        overlap_pct=overlap_pct
+        overlap_pct=overlap_pct,
+        avg_confidence=avg_confidence,
+        median_confidence=median_confidence,
+        min_confidence=min_confidence_val,
+        max_confidence=max_confidence_val,
+        low_confidence_results=low_confidence_results,
+        engine_counts=engine_counts,
     )
 
     # Generate debug output if visualizer is enabled

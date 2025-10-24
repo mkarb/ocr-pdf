@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Tuple, Optional, Dict, Literal
+from typing import List, Tuple, Optional, Dict, Literal, Any
 
 # --------------------------------------------------------------------
 # Shared alias
@@ -38,6 +38,7 @@ class PageVectors:
     rotation: int        # 0/90/180/270
     geoms: List[VectorGeom]
     texts: List[TextRun]
+    ocr_stats: Optional[Dict[str, Any]] = None
 
 @dataclass(frozen=True)
 class DocMeta:

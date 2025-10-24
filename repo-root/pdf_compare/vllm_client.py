@@ -57,7 +57,7 @@ class VLLMClient:
     def __init__(
         self,
         base_url: Optional[str] = None,
-        timeout: int = 30,
+        timeout: int = 600,
         verify_ssl: bool = True
     ):
         """
@@ -97,7 +97,7 @@ class VLLMClient:
         try:
             response = requests.get(
                 f"{self.base_url}/health",
-                timeout=5,
+                timeout=15,
                 verify=self.verify_ssl
             )
 
@@ -121,7 +121,7 @@ class VLLMClient:
         self,
         prompt: str,
         temperature: float = 0.1,
-        max_tokens: int = 512
+        max_tokens: int = 256
     ) -> str:
         """
         Single text query to LLM.

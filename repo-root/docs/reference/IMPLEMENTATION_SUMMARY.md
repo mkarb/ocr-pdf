@@ -42,6 +42,23 @@
 - `docker-compose-postgres.yml` - Docker setup
 - `DATABASE_COMPARISON.md` - Migration guide
 
+### 4. OCR Confidence Instrumentation & Table CSV Export
+**Problem**: We needed better visibility into OCR quality (per-page and per-tile) and a first-class way to export detected tables as ready-to-use CSVs.
+
+**Solution**:
+- Added shaded-background removal and vertical rule masking in `highres_ocr.py` to stabilise confidence scores in complex engineering tables.
+- Every tiled OCR run now emits summary stats (average/median confidence, low-confidence counts, per-engine breakdown) via `TileOCRReport` and persists page-level metrics on `PageVectors.ocr_stats` (also stored in the `meta` table).
+- High-level table helpers (`pdf_compare/table_extractor.py`) now accept `csv_output_dir` and `combined_csv_path` so extraction automatically writes individual table CSVs and a combined sheet. The Streamlit workflows surface the output directory and reuse a shared `tables_to_csv_string` helper.
+
+**Files**:
+- `pdf_compare/analyzers/highres_ocr.py`
+- `pdf_compare/pdf_extract.py`
+- `pdf_compare/models.py`
+- `pdf_compare/db_backend.py`
+- `pdf_compare/table_extractor.py`
+- `pdf_compare/table_workflows.py`
+- `ui/streamlit_app.py`
+
 ## How to Use
 
 ### Quick Start: Test RAG System

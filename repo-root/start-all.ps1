@@ -33,9 +33,44 @@ Write-Host " PDF Compare Complete Startup" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
-# Change to repo directory
-$RepoRoot = "H:\repo-root\ocr-pdf\repo-root"
+# Change to repo directory dynamically based on script location
+$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = (Resolve-Path $ScriptRoot).Path
 Set-Location $RepoRoot
+
+function Load-DotEnv {
+    param(
+        [string]$Path
+    )
+
+    if (-not (Test-Path $Path)) {
+        return
+    }
+
+    Write-Host "Loading environment variables from $Path" -ForegroundColor DarkGray
+
+    Get-Content $Path | ForEach-Object {
+        $line = $_.Trim()
+        if ([string]::IsNullOrWhiteSpace($line)) { return }
+        if ($line.StartsWith("#")) { return }
+        $parts = $line.Split("=", 2)
+        if ($parts.Count -lt 2) { return }
+
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim()
+
+        if (($value.StartsWith('"') -and $value.EndsWith('"')) -or
+            ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($key)) {
+            Set-Item -Path "Env:$key" -Value $value
+        }
+    }
+}
+
+Load-DotEnv (Join-Path $RepoRoot ".env")
 
 function Stop-VllmService {
     $vllmProcesses = Get-Process -Name python -ErrorAction SilentlyContinue | Where-Object {
@@ -62,7 +97,8 @@ function Stop-VllmService {
 
 function Start-VllmService {
     param(
-        [string]$RepoRoot
+        [string]$RepoRoot,
+        [int]$Port
     )
 
     Write-Host ""
@@ -81,7 +117,7 @@ function Start-VllmService {
     $cmd += "`$env:VLLM_TEXT_MODEL='$env:VLLM_TEXT_MODEL'; "
     $cmd += "`$env:VLLM_VISION_MODEL='$env:VLLM_VISION_MODEL'; "
     $cmd += "`$env:ENABLE_VISION_OCR='$env:ENABLE_VISION_OCR'; "
-    $cmd += "`$env:PORT='$env:PORT'; "
+    $cmd += "`$env:PORT='$Port'; "
     $cmd += "Write-Host 'Starting Qwen Service...' -ForegroundColor Cyan; "
     $cmd += "& '$pythonExe' '$vllmScriptPath'"
 
@@ -99,7 +135,7 @@ function Start-VllmService {
         $waited += 5
 
         try {
-            $response = Invoke-WebRequest -Uri "http://localhost:8001/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri "http://localhost:$Port/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
             $health = $response.Content | ConvertFrom-Json
 
             if ($health.status -eq "healthy" -and $health.text_model_loaded -eq $true -and $health.vision_model_loaded -eq $true) {
@@ -116,9 +152,10 @@ function Start-VllmService {
 
     if ($healthy) {
         Write-Host "  vLLM service started successfully - Models loaded:" -ForegroundColor Green
-        Write-Host "    Text Model:   Qwen2.5-7B-Instruct (GPU)" -ForegroundColor Gray
-        Write-Host "    Vision Model: Qwen2-VL-7B-Instruct (GPU)" -ForegroundColor Gray
+        Write-Host "    Text Model:   $env:VLLM_TEXT_MODEL" -ForegroundColor Gray
+        Write-Host "    Vision Model: $env:VLLM_VISION_MODEL" -ForegroundColor Gray
         Write-Host "    GPU Count:    $($health.gpu_count)" -ForegroundColor Gray
+        Write-Host "    Port:         $Port" -ForegroundColor Gray
         return $true
     }
     else {
@@ -138,26 +175,24 @@ if (-not $SkipVLLM) {
     Write-Host "------------------------------" -ForegroundColor DarkGray
 
     # Check if .env exists
-    if (-not (Test-Path .env)) {
+    $envPath = Join-Path $RepoRoot ".env"
+    if (-not (Test-Path $envPath)) {
         Write-Host "ERROR: .env file not found!" -ForegroundColor Red
         Write-Host "Please create .env with your HF_TOKEN" -ForegroundColor Red
         exit 1
     }
 
-    # Load environment variables from .env
-    Get-Content .env | ForEach-Object {
-        if ($_ -match '^\s*([^#][^=]+)=(.*)$') {
-            $name = $matches[1].Trim()
-            $value = $matches[2].Trim()
-            Set-Item -Path "env:$name" -Value $value
-        }
-    }
+    # Ensure defaults for required settings
+    if (-not $env:VLLM_TEXT_MODEL) { $env:VLLM_TEXT_MODEL = "Qwen/Qwen2.5-7B-Instruct" }
+    if (-not $env:VLLM_VISION_MODEL) { $env:VLLM_VISION_MODEL = "Qwen/Qwen2-VL-7B-Instruct" }
+    if (-not $env:ENABLE_VISION_OCR) { $env:ENABLE_VISION_OCR = "true" }
 
-    # Set service configuration
-    $env:VLLM_TEXT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-    $env:VLLM_VISION_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
-    $env:ENABLE_VISION_OCR = "true"
-    $env:PORT = "8001"
+    $vllmPortValue = $env:VLLM_SERVICE_PORT
+    if ([string]::IsNullOrWhiteSpace($vllmPortValue)) { $vllmPortValue = $env:PORT }
+    if ([string]::IsNullOrWhiteSpace($vllmPortValue)) { $vllmPortValue = "8001" }
+
+    [int]$script:VllmServicePort = [int]$vllmPortValue
+    $env:PORT = $script:VllmServicePort
 
     Write-Host "  Configuration loaded" -ForegroundColor Gray
 
@@ -166,7 +201,7 @@ if (-not $SkipVLLM) {
     $startVllm = $false
     $restartExisting = $false
     try {
-        $response = Invoke-WebRequest -Uri "http://localhost:8001/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        $response = Invoke-WebRequest -Uri ("http://localhost:{0}/health" -f $script:VllmServicePort) -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
         $health = $response.Content | ConvertFrom-Json
 
         # Verify models are loaded
@@ -195,7 +230,7 @@ if (-not $SkipVLLM) {
             Stop-VllmService
         }
 
-        $vllmRunning = Start-VllmService -RepoRoot $RepoRoot
+        $vllmRunning = Start-VllmService -RepoRoot $RepoRoot -Port $script:VllmServicePort
 
         if (-not $vllmRunning) {
             Write-Host ""
@@ -207,7 +242,7 @@ if (-not $SkipVLLM) {
 
 if ($VLLMOnly) {
     Write-Host "vLLM service is running." -ForegroundColor Green
-    Write-Host "Access at: http://localhost:8001" -ForegroundColor Cyan
+    Write-Host ("Access at: http://localhost:{0}" -f $script:VllmServicePort) -ForegroundColor Cyan
     Write-Host ""
     exit 0
 }
@@ -313,7 +348,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Services:" -ForegroundColor White
 Write-Host "  UI:        http://localhost" -ForegroundColor Cyan
-Write-Host "  vLLM API:  http://localhost:8001" -ForegroundColor Cyan
+Write-Host ("  vLLM API:  http://localhost:{0}" -f $script:VllmServicePort) -ForegroundColor Cyan
 Write-Host ""
 Write-Host "To stop: .\stop-all.ps1" -ForegroundColor Yellow
 Write-Host ""

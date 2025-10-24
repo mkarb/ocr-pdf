@@ -21,15 +21,23 @@ import base64
 import json
 import asyncio
 from typing import List, Optional
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from io import BytesIO
+
+# Ensure PyTorch uses expandable segments to reduce OOM fragmentation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    AutoProcessor,
+    AutoModelForVision2Seq,
+)
 from PIL import Image
 
 # Configure logging
@@ -103,8 +111,8 @@ async def lifespan(app: FastAPI):
         )
         text_model = AutoModelForCausalLM.from_pretrained(
             text_model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto",
+            torch_dtype=torch.float32,
+            device_map="cpu",
             trust_remote_code=True
         )
         logger.info("✓ Text model ready")
@@ -116,7 +124,7 @@ async def lifespan(app: FastAPI):
                 vision_model_name,
                 trust_remote_code=True
             )
-            vision_model = Qwen2VLForConditionalGeneration.from_pretrained(
+            vision_model = AutoModelForVision2Seq.from_pretrained(
                 vision_model_name,
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 device_map="auto",
@@ -292,29 +300,36 @@ Where bbox coordinates are percentages (0-100) of image width/height."""
 
         # Process
         text = vision_processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
         )
-        image_inputs, video_inputs = vision_processor.process_vision_info(messages)
 
         inputs = vision_processor(
+            images=image,
             text=[text],
-            images=image_inputs,
-            videos=video_inputs,
             padding=True,
-            return_tensors="pt",
-        ).to(device)
+            return_tensors="pt"
+        )
+
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
         # Generate
         with torch.no_grad():
-            generated_ids = vision_model.generate(
-                **inputs,
-                max_new_tokens=2048,
-                temperature=0.1,
+            autocast_ctx = (
+                torch.autocast(device_type=device.type, dtype=torch.float16)
+                if device.type == "cuda"
+                else nullcontext()
             )
+            with autocast_ctx:
+                generated_ids = vision_model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    temperature=0.1,
+                )
 
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
+        input_length = inputs["input_ids"].shape[-1]
+        generated_ids_trimmed = generated_ids[:, input_length:]
 
         output_text = vision_processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
@@ -334,6 +349,9 @@ Where bbox coordinates are percentages (0-100) of image width/height."""
             t for t in texts
             if t.get("confidence", 0) >= request.min_confidence
         ]
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         return {"texts": filtered, "total": len(filtered)}
 

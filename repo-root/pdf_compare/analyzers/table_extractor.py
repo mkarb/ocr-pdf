@@ -15,7 +15,7 @@ Uses hybrid detection approach:
 """
 
 from __future__ import annotations
-from typing import List, Dict, Tuple, Optional, Any, Iterable
+from typing import List, Dict, Tuple, Optional, Any, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -1338,10 +1338,38 @@ class TableExtractor:
                 print(f"Warning: pandas not installed, skipping CSV export for {table.table_id}")
 
 
+def tables_to_csv_string(tables: Sequence[Table]) -> str:
+    """
+    Combine multiple tables into a single CSV string.
+
+    The output CSV prefixes each table with metadata columns (`Table ID`, `Table Type`, `Page`)
+    so downstream tools can differentiate rows originating from different tables.
+    """
+    try:
+        import pandas as pd
+    except ImportError as exc:  # pragma: no cover - runtime dependency
+        raise ImportError("pandas is required for CSV export.") from exc
+
+    frames = []
+    for table in tables:
+        df = table.to_dataframe()
+        df.insert(0, "Table ID", table.table_id)
+        df.insert(1, "Table Type", table.table_type)
+        df.insert(2, "Page", table.page)
+        frames.append(df)
+
+    if not frames:
+        return ""
+
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.to_csv(index=False)
+
+
 __all__ = [
     "TableCell",
     "TableRow",
     "Table",
     "TableExtractionConfig",
     "TableExtractor",
+    "tables_to_csv_string",
 ]

@@ -29,11 +29,11 @@ if (Test-Path .env) {
     exit 1
 }
 
-# Set service configuration
-$env:VLLM_TEXT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-$env:VLLM_VISION_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
-$env:ENABLE_VISION_OCR = "true"
-$env:PORT = "8000"
+# Set service configuration (use values from .env if provided)
+$env:VLLM_TEXT_MODEL = if ($env:VLLM_TEXT_MODEL) { $env:VLLM_TEXT_MODEL } else { "Qwen/Qwen2.5-7B-Instruct" }
+$env:VLLM_VISION_MODEL = if ($env:VLLM_VISION_MODEL) { $env:VLLM_VISION_MODEL } else { "Qwen/Qwen2-VL-7B-Instruct" }
+$env:ENABLE_VISION_OCR = if ($env:ENABLE_VISION_OCR) { $env:ENABLE_VISION_OCR } else { "true" }
+$env:PORT = if ($env:PORT) { $env:PORT } else { "8000" }
 
 Write-Host ""
 Write-Host "Configuration:" -ForegroundColor Green

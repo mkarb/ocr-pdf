@@ -783,12 +783,17 @@ with workspace_tab:
                     else:
                         with st.spinner("Extracting BOM from drawing..."):
                             try:
+                                filename = Path(doc_path).stem
+                                per_table_dir = outputs_dir / "tables" / filename
+                                combined_csv_path = outputs_dir / f"{filename}_tables.csv"
                                 result = run_quick_bom_extraction(
                                     backend,
                                     bom_doc_id,
                                     doc_path,
                                     dpi=bom_dpi,
                                     page_numbers=page_numbers,
+                                    csv_output_dir=per_table_dir,
+                                    combined_csv_path=combined_csv_path,
                                 )
 
                                 if not result.all_tables:
@@ -800,6 +805,7 @@ with workspace_tab:
                                         )
 
                                     st.success(f"Found {len(result.bom_tables)} table(s) for export")
+                                    st.caption(f"Per-table CSVs saved to `{per_table_dir}`")
 
                                     summary = summarise_tables(result.bom_tables)
                                     if summary["Table ID"]:
@@ -815,7 +821,6 @@ with workspace_tab:
                                         st.code(traceback.format_exc())
                                     else:
                                         if csv_data:
-                                            filename = Path(doc_path).stem
                                             output_csv = outputs_dir / f"{filename}_BOM.csv"
                                             output_csv.write_text(csv_data, encoding="utf-8")
 
@@ -888,6 +893,9 @@ with workspace_tab:
 
                         with st.spinner("Extracting tables from PDF..."):
                             try:
+                                filename = Path(doc_path).stem
+                                per_table_dir = outputs_dir / "tables" / filename
+                                combined_csv_path = outputs_dir / f"{filename}_tables_all.csv"
                                 tables = run_table_extraction(
                                     backend,
                                     table_doc_id,
@@ -895,6 +903,8 @@ with workspace_tab:
                                     dpi=table_dpi,
                                     ocr_min_conf=ocr_conf,
                                     page_numbers=page_numbers,
+                                    csv_output_dir=per_table_dir,
+                                    combined_csv_path=combined_csv_path,
                                 )
                             except Exception as exc:
                                 st.error(f"Table extraction failed: {exc}")
@@ -905,6 +915,7 @@ with workspace_tab:
                                     st.warning("No tables detected in the selected pages.")
                                 else:
                                     st.success(f"Extracted {len(tables)} table(s)")
+                                    st.caption(f"Per-table CSVs saved to `{per_table_dir}`")
 
                                     # Store in per-session state
                                     SessionManager.set_user_state("extracted_tables", tables)

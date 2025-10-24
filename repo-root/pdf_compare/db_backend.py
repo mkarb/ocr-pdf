@@ -4,7 +4,7 @@ Provides ORM-based storage for PDF vector data with full-text search support.
 """
 
 from __future__ import annotations
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 import json
 import os
 import random
@@ -188,8 +188,11 @@ class DatabaseBackend:
             session.execute(delete(Page).where(Page.doc_id == vm.meta.doc_id))
             session.execute(delete(GeometryRow).where(GeometryRow.doc_id == vm.meta.doc_id))
             session.execute(delete(TextRow).where(TextRow.doc_id == vm.meta.doc_id))
+            ocr_meta_key = f"ocr_stats:{vm.meta.doc_id}"
+            session.execute(delete(Meta).where(Meta.key == ocr_meta_key))
 
             # Insert pages + payload
+            ocr_stats_payload: Dict[str, Dict[str, Any]] = {}
             for pg in vm.pages:
                 # Insert page metadata
                 session.add(Page(
@@ -236,6 +239,15 @@ class DatabaseBackend:
                         ))
                     session.bulk_save_objects(text_objs)
 
+                if pg.ocr_stats:
+                    ocr_stats_payload[str(pg.page_number)] = pg.ocr_stats
+
+            if ocr_stats_payload:
+                session.add(Meta(
+                    key=ocr_meta_key,
+                    value=json.dumps(ocr_stats_payload)
+                ))
+
             session.commit()
 
     def list_documents(self) -> List[Tuple[str, str, int]]:
@@ -270,6 +282,15 @@ class DatabaseBackend:
             page_rows = pages_query.order_by(Page.page_number).all()
             if not page_rows:
                 return None
+
+            ocr_meta_key = f"ocr_stats:{doc_id}"
+            ocr_stats_map: Dict[str, Any] = {}
+            meta_row = session.get(Meta, ocr_meta_key)
+            if meta_row and meta_row.value:
+                try:
+                    ocr_stats_map = json.loads(meta_row.value)
+                except json.JSONDecodeError:
+                    ocr_stats_map = {}
 
             geom_query = session.query(GeometryRow).filter(GeometryRow.doc_id == doc_id)
             text_query = session.query(TextRow).filter(TextRow.doc_id == doc_id)
@@ -328,6 +349,7 @@ class DatabaseBackend:
                         rotation=page_row.rotation or 0,
                         geoms=geom_map.get(page_number, []),
                         texts=text_map.get(page_number, []),
+                        ocr_stats=ocr_stats_map.get(str(page_number)),
                     )
                 )
 

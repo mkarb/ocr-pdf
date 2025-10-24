@@ -33,6 +33,7 @@ class LayoutDetector:
         min_diagram_size: int = 200,
         min_text_width: int = 100,
         line_length_threshold: int = 40,
+        max_region_pct: float = 0.7,  # Maximum region size as percentage of page (0.7 = 70%)
         debug: bool = False
     ):
         """
@@ -43,12 +44,14 @@ class LayoutDetector:
             min_diagram_size: Minimum width/height for diagram detection
             min_text_width: Minimum width for text block detection
             line_length_threshold: Minimum line length for table detection
+            max_region_pct: Maximum region size as percentage of page dimensions
             debug: Enable debug output
         """
         self.min_table_size = min_table_size
         self.min_diagram_size = min_diagram_size
         self.min_text_width = min_text_width
         self.line_length_threshold = line_length_threshold
+        self.max_region_pct = max_region_pct
         self.debug = debug
 
     def detect_tables(self, image: np.ndarray) -> List[LayoutRegion]:
@@ -84,30 +87,47 @@ class LayoutDetector:
         # Find contours
         contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        # Get image dimensions for maximum size filtering
+        img_height, img_width = gray.shape
+        max_width = int(img_width * self.max_region_pct)
+        max_height = int(img_height * self.max_region_pct)
+
         table_regions = []
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
 
-            # Filter by size
+            # Filter by size (both minimum and maximum)
             if w < self.min_table_size or h < self.min_table_size:
                 continue
 
-            # Calculate confidence based on grid structure
-            # More lines = higher confidence
-            roi = table_mask[y:y+h, x:x+w]
-            line_density = np.sum(roi > 0) / (w * h)
-            confidence = min(95, 60 + line_density * 500)
+            # Skip regions that are too large (likely false positives encompassing the whole page)
+            if w > max_width or h > max_height:
+                if self.debug:
+                    print(f"[LayoutDetector] Skipping oversized table region: {w}x{h} (max: {max_width}x{max_height})")
+                continue
 
+            # Validate grid structure using helper method
+            roi = table_mask[y:y+h, x:x+w]
+            roi_h_lines = horizontal_lines[y:y+h, x:x+w]
+            roi_v_lines = vertical_lines[y:y+h, x:x+w]
+
+            is_valid, metrics = self._validate_table_grid(roi, roi_h_lines, roi_v_lines, w, h)
+
+            if not is_valid:
+                continue  # Skip regions that don't have proper table grid structure
+
+            # Calculate confidence based on grid quality
+            grid_quality = min(metrics["estimated_cells"] / 20.0, 1.0)
+            density_score = min(metrics["line_density"] * 500, 30)
+            intersection_score = min(metrics["intersection_density"] * 10000, 20)
+            confidence = min(95, 50 + density_score + intersection_score + grid_quality * 25)
+
+            metrics["method"] = "line_detection"
             table_regions.append(LayoutRegion(
                 bbox=(x, y, x+w, y+h),
                 region_type="table",
                 confidence=confidence,
-                metadata={
-                    "method": "line_detection",
-                    "line_density": float(line_density),
-                    "has_horizontal": np.sum(horizontal_lines[y:y+h, x:x+w]) > 0,
-                    "has_vertical": np.sum(vertical_lines[y:y+h, x:x+w]) > 0
-                }
+                metadata=metrics
             ))
 
         if self.debug:
@@ -283,6 +303,63 @@ class LayoutDetector:
                 print(f"  {i+1}. {region.region_type} @ {region.bbox} (conf={region.confidence:.1f})")
 
         return regions
+
+    def _validate_table_grid(
+        self,
+        roi: np.ndarray,
+        h_lines: np.ndarray,
+        v_lines: np.ndarray,
+        width: int,
+        height: int
+    ) -> Tuple[bool, dict]:
+        """
+        Validate if a region has proper table grid structure.
+
+        Returns:
+            (is_valid, metrics_dict)
+        """
+        # Count distinct horizontal and vertical lines via projection
+        h_projection = np.sum(h_lines, axis=1) > 0
+        v_projection = np.sum(v_lines, axis=0) > 0
+        h_line_count = np.sum(np.diff(h_projection.astype(int)) != 0) // 2
+        v_line_count = np.sum(np.diff(v_projection.astype(int)) != 0) // 2
+
+        # Count grid intersections
+        intersections = cv2.bitwise_and(h_lines, v_lines)
+        intersection_count = np.sum(intersections > 0)
+        intersection_density = intersection_count / (width * height)
+
+        # Estimate cell count (grid cells formed by lines)
+        estimated_cells = max(h_line_count - 1, 0) * max(v_line_count - 1, 0)
+
+        # Line density
+        line_density = np.sum(roi > 0) / (width * height)
+
+        # Validation criteria
+        min_cells = 4
+        min_intersection_density = 0.001
+
+        is_valid = (
+            estimated_cells >= min_cells and
+            intersection_density >= min_intersection_density
+        )
+
+        metrics = {
+            "line_density": float(line_density),
+            "h_line_count": int(h_line_count),
+            "v_line_count": int(v_line_count),
+            "estimated_cells": int(estimated_cells),
+            "intersection_density": float(intersection_density),
+            "intersection_count": int(intersection_count)
+        }
+
+        if self.debug and not is_valid:
+            if estimated_cells < min_cells:
+                print(f"[LayoutDetector] Rejected: {h_line_count}h × {v_line_count}v = {estimated_cells} cells < {min_cells}")
+            elif intersection_density < min_intersection_density:
+                print(f"[LayoutDetector] Rejected: intersection density {intersection_density:.4f} < {min_intersection_density}")
+
+        return is_valid, metrics
 
     def _iou(self, box1: Tuple[int, int, int, int], box2: Tuple[int, int, int, int]) -> float:
         """Calculate Intersection over Union between two boxes."""

@@ -150,7 +150,7 @@ def _extract_text(
     enable_upscaling: bool = False,
     upscale_factor: float = 1.5,
     qwen_prompt_mode: str = DEFAULT_QWEN_PROMPT_MODE,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Extract native text spans as plain dicts: {"text": str, "bbox": (x0,y0,x1,y1), "font": str|None, "size": float|None}
     Optionally runs OCR if enable_ocr=True and minimal native text is found.
@@ -168,6 +168,7 @@ def _extract_text(
         qwen_prompt_mode: Prompt preset to use when ocr_engine == "qwen-vl"
     """
     runs: List[Dict[str, Any]] = []
+    page_ocr_stats: Optional[Dict[str, Any]] = None
     raw = page.get_text("dict") or {}
     for blk in raw.get("blocks", []):
         for line in blk.get("lines", []):
@@ -230,12 +231,13 @@ def _extract_text(
                 # Use tiled OCR for large pages
                 print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using tiled OCR at {dpi} DPI (page too large for single tile)", file=sys.stderr)
 
+                min_conf_threshold = 50  # Lowered from 60 to capture more text (some may be lower confidence)
                 ocr_results, report = tiled_ocr(
                     pdf_path=pdf_path,
                     page_index=page_index,
                     dpi=dpi,
                     psm=11,
-                    min_conf=50,  # Lowered from 60 to capture more text (some may be lower confidence)
+                    min_conf=min_conf_threshold,
                     overlap_pct=0.35,  # Increased from 0.20 to better capture text at boundaries
                     skip_empty=True,
                     max_workers=1,  # Serial in Streamlit
@@ -251,7 +253,34 @@ def _extract_text(
                     qwen_prompt_mode=qwen_prompt_mode,
                 )
 
-                print(f"OCR: page {page_index+1}: Tiled OCR complete - {report.tiles_processed}/{report.total_tiles} tiles processed, {report.tiles_skipped_empty} skipped, {len(ocr_results)} text items, {report.duplicates_removed} duplicates removed", file=sys.stderr)
+                engine_summary = ", ".join(f"{k}:{v}" for k, v in sorted(report.engine_counts.items())) or "n/a"
+                print(
+                    f"OCR: page {page_index+1}: Tiled OCR complete - "
+                    f"{report.tiles_processed}/{report.total_tiles} tiles processed, "
+                    f"{report.tiles_skipped_empty} skipped, "
+                    f"{len(ocr_results)} text items, "
+                    f"avg_conf={report.avg_confidence:.1f}, "
+                    f"low<{min_conf_threshold}={report.low_confidence_results}, "
+                    f"{report.duplicates_removed} duplicates removed, "
+                    f"engines=[{engine_summary}]",
+                    file=sys.stderr,
+                )
+
+                page_ocr_stats = {
+                    "mode": "tiled",
+                    "tiles_processed": report.tiles_processed,
+                    "tiles_total": report.total_tiles,
+                    "tiles_skipped": report.tiles_skipped_empty,
+                    "avg_confidence": report.avg_confidence,
+                    "median_confidence": report.median_confidence,
+                    "min_confidence": report.min_confidence,
+                    "max_confidence": report.max_confidence,
+                    "low_confidence_count": report.low_confidence_results,
+                    "engine_counts": report.engine_counts,
+                    "duplicates_removed": report.duplicates_removed,
+                    "processing_time_sec": report.processing_time,
+                    "min_conf_threshold": min_conf_threshold,
+                }
 
             else:
                 # Use whole-page OCR for pages that fit
@@ -268,6 +297,39 @@ def _extract_text(
                 ocr_results = highres_ocr(pdf_path, page_index, config, debug_visualizer=debug_visualizer)
 
                 print(f"OCR: page {page_index+1}: Extracted {len(ocr_results)} text items", file=sys.stderr)
+
+                confidences = [
+                    int(r.get("conf", 0))
+                    for r in ocr_results
+                    if r.get("conf") is not None
+                ]
+                if confidences:
+                    avg_confidence = float(np.mean(confidences))
+                    median_confidence = float(np.median(confidences))
+                    min_confidence_val = int(np.min(confidences))
+                    max_confidence_val = int(np.max(confidences))
+                    low_confidence_count = sum(1 for c in confidences if c < config.min_conf)
+                else:
+                    avg_confidence = median_confidence = 0.0
+                    min_confidence_val = max_confidence_val = 0
+                    low_confidence_count = 0
+
+                engine_counts = {}
+                for r in ocr_results:
+                    engine_id = r.get("source") or config.engine
+                    engine_counts[engine_id] = engine_counts.get(engine_id, 0) + 1
+
+                page_ocr_stats = {
+                    "mode": "single-pass",
+                    "avg_confidence": avg_confidence,
+                    "median_confidence": median_confidence,
+                    "min_confidence": min_confidence_val,
+                    "max_confidence": max_confidence_val,
+                    "low_confidence_count": low_confidence_count,
+                    "engine_counts": engine_counts,
+                    "processing_time_sec": None,
+                    "min_conf_threshold": config.min_conf,
+                }
 
             # Add OCR results to runs
             for ocr_text in ocr_results:
@@ -293,7 +355,7 @@ def _extract_text(
             print(f"OCR warning for page {page_index}: {e}", file=sys.stderr)
             print(f"OCR traceback: {traceback.format_exc()}", file=sys.stderr)
 
-    return runs
+    return runs, page_ocr_stats
 
 
 # Note: Worker initialization and document caching are now handled by worker_pool module
@@ -334,7 +396,7 @@ def _extract_page_job(
         bezier_samples=bezier_samples,
         simplify_tolerance=simplify_tolerance,
     )
-    texts = _extract_text(
+    texts, ocr_stats = _extract_text(
         pg,
         pdf_path=pdf_path,
         page_index=page_index,
@@ -359,6 +421,7 @@ def _extract_page_job(
         "rotation": int(rotation),
         "geoms": geoms,   # list of dicts
         "texts": texts,   # list of dicts
+        "ocr_stats": ocr_stats,
     }
     # Note: Don't close doc - it's cached for reuse
     return out
@@ -538,6 +601,7 @@ def pdf_to_vectormap(
                 rotation=r["rotation"],
                 geoms=geoms_dc,
                 texts=texts_dc,
+                ocr_stats=r.get("ocr_stats"),
             )
         )
 

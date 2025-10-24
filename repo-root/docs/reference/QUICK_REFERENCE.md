@@ -115,6 +115,41 @@ for page in vectormap.pages:
     print(f"Page {page.page_number}: {len(page.geoms)} geometries, {len(page.texts)} text runs")
 ```
 
+### Extract Tables and Write CSVs
+```python
+from pathlib import Path
+from pdf_compare.db_backend import create_backend
+from pdf_compare.table_extractor import extract_tables
+from pdf_compare.analyzers.table_extractor import tables_to_csv_string, TableExtractionConfig
+
+backend = create_backend("postgresql://user:pass@localhost:5432/pdfcompare")
+output_dir = Path("outputs/tables")
+
+tables = extract_tables(
+    backend,
+    doc_id="drawing-123",
+    doc_path="data/drawing.pdf",
+    config=TableExtractionConfig(dpi=400, ocr_min_conf=40),
+    csv_output_dir=output_dir / "drawing-123",
+    combined_csv_path=output_dir / "drawing-123_all_tables.csv",
+)
+
+# Optional: combined CSV content in memory
+csv_payload = tables_to_csv_string(tables)
+print(csv_payload[:200])
+```
+
+### Inspect OCR Confidence Metrics
+```python
+from pdf_compare.pdf_extract import pdf_to_vectormap
+
+vm = pdf_to_vectormap("data/drawing.pdf", enable_ocr=True)
+for page in vm.pages:
+    stats = page.ocr_stats or {}
+    print(f"Page {page.page_number} OCR avg={stats.get('avg_confidence', 0):.1f} "
+          f"low<{stats.get('min_conf_threshold', 0)}={stats.get('low_confidence_count', 0)}")
+```
+
 ---
 
 ## Streamlit UI Features
