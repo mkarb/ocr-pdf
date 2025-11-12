@@ -672,94 +672,6 @@ def _qwen_vl_client() -> Any:
     return _QWEN_VL_OCR
 
 
-def _ocr_tile_qwen_vl_base(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
-    """Call the Qwen2-VL service for a tile guaranteed to be within size limits."""
-    client = _qwen_vl_client()
-
-    try:
-        results = client.extract_text_from_image(
-            gray,
-            focus_technical=True,
-            prompt_mode=cfg.qwen_prompt_mode,
-        )
-    except VLLMServiceUnavailable:
-        import sys
-        print("OCR: vLLM service unavailable, fallback required", file=sys.stderr)
-        raise
-
-    out: List[Dict[str, Any]] = []
-    for item in results:
-        conf = int(item.get("confidence", 1.0) * 100)
-        if conf < cfg.min_conf:
-            continue
-
-        out.append({
-            "text": item["text"],
-            "bbox": item["bbox"],
-            "conf": conf,
-            "source": "ocr-qwen-vl"
-        })
-
-    return out
-
-
-def _qwen_generate_slices(length: int) -> List[Tuple[int, int]]:
-    """Create overlapping slices that keep segment length within the Qwen limit."""
-    if length <= QWEN_VL_MAX_SIDE:
-        return [(0, length)]
-
-    overlap = max(32, int(QWEN_VL_MAX_SIDE * QWEN_VL_SUBTILE_OVERLAP_RATIO))
-    step = max(1, QWEN_VL_MAX_SIDE - overlap)
-
-    slices: List[Tuple[int, int]] = []
-    start = 0
-    while start < length:
-        end = min(length, start + QWEN_VL_MAX_SIDE)
-        slices.append((start, end))
-        if end >= length:
-            break
-        start = end - overlap
-
-    return slices
-
-
-def _ocr_tile_qwen_vl(gray: np.ndarray, cfg: HighResOCRConfig, *, _depth: int = 0) -> List[Dict]:
-    """
-    Run Qwen2-VL on a grayscale tile via vLLM microservice.
-    Automatically sub-tiles oversized inputs so we maintain high DPI without exceeding
-    the 4K vision-model limit.
-    """
-    height, width = gray.shape[:2]
-    max_dim = max(height, width)
-
-    if max_dim <= QWEN_VL_MAX_SIDE:
-        return _ocr_tile_qwen_vl_base(gray, cfg)
-
-    # Subdivide oversized tiles with overlap to preserve context
-    y_slices = _qwen_generate_slices(height)
-    x_slices = _qwen_generate_slices(width)
-    aggregated: List[Dict[str, Any]] = []
-
-    for y0, y1 in y_slices:
-        for x0, x1 in x_slices:
-            sub_gray = gray[y0:y1, x0:x1]
-            sub_results = _ocr_tile_qwen_vl(sub_gray, cfg, _depth=_depth + 1)
-            for item in sub_results:
-                x_start, y_start, x_end, y_end = item["bbox"]
-                aggregated.append({
-                    **item,
-                    "bbox": (
-                        x_start + x0,
-                        y_start + y0,
-                        x_end + x0,
-                        y_end + y0,
-                    ),
-                })
-
-    # Deduplicate overlaps introduced by sub-tiling
-    return merge_and_deduplicate(aggregated)
-
-
 def _get_engine_max_dimension(engine: str) -> int:
     """Get maximum tile dimension for each OCR engine."""
     if engine == "tesseract":
@@ -772,62 +684,49 @@ def _get_engine_max_dimension(engine: str) -> int:
         return 29000  # Default to Tesseract limit
 
 
-def _ocr_tile_with_splitting(gray: np.ndarray, cfg: HighResOCRConfig, depth: int = 0) -> List[Dict]:
+def _ocr_tile_with_splitting(
+    gray: np.ndarray,
+    cfg: HighResOCRConfig,
+    depth: int = 0,
+    *,
+    overlap_ratio: Optional[float] = None
+) -> List[Dict]:
     """
-    Unified tile OCR with automatic recursive splitting for oversized tiles.
-
-    This function handles tile size validation and splitting BEFORE calling
-    the engine-specific OCR functions, so each engine doesn't need its own
-    splitting logic.
-
-    Args:
-        gray: Grayscale tile image
-        cfg: OCR configuration
-        depth: Recursion depth (for logging/debugging)
-
-    Returns:
-        List of OCR results with bboxes in tile pixel coordinates
+    Recursively subdivides using overlapping 1-D slices on x & y axes
+    until each sub-image fits the engine's max side length.
     """
-    height, width = gray.shape
-    max_dim = _get_engine_max_dimension(cfg.engine)
+    h, w = gray.shape[:2]
+    max_side = _get_engine_max_dimension(cfg.engine)
+    overlap_ratio = _default_overlap_ratio_for_engine(cfg.engine) if overlap_ratio is None else overlap_ratio
 
-    # Check if tile exceeds engine's size limit
-    if width > max_dim or height > max_dim:
-        import sys
-        indent = "  " * depth
-        print(f"{indent}[{cfg.engine.upper()}] Tile {width}x{height}px exceeds {max_dim}px limit - splitting into 4 sub-tiles", file=sys.stderr)
+    # Base case: fits in one go
+    if max(h, w) <= max_side:
+        return _run_engine_base_infer(gray, cfg)
 
-        # Split into 2x2 grid (4 sub-tiles)
-        mid_x = width // 2
-        mid_y = height // 2
+    # Create overlapping grid
+    y_slices = _generate_slices_1d(h, max_side, overlap_ratio)
+    x_slices = _generate_slices_1d(w, max_side, overlap_ratio)
 
-        sub_tiles = [
-            ("top-left",     gray[0:mid_y, 0:mid_x],        0,     0),
-            ("top-right",    gray[0:mid_y, mid_x:width],    mid_x, 0),
-            ("bottom-left",  gray[mid_y:height, 0:mid_x],   0,     mid_y),
-            ("bottom-right", gray[mid_y:height, mid_x:width], mid_x, mid_y),
-        ]
+    aggregated: List[Dict[str, Any]] = []
+    for y0, y1 in y_slices:
+        for x0, x1 in x_slices:
+            sub_gray = gray[y0:y1, x0:x1]
 
-        all_results = []
-        for label, sub_gray, offset_x, offset_y in sub_tiles:
-            # Recursively process sub-tile
-            sub_results = _ocr_tile_with_splitting(sub_gray, cfg, depth + 1)
+            # Recurse in case numeric imprecision or downstream constraints still exceed limit
+            sub_results = _ocr_tile_with_splitting(
+                sub_gray, cfg, depth=depth + 1, overlap_ratio=overlap_ratio
+            )
 
-            # Adjust bounding boxes to parent tile coordinates
-            for result in sub_results:
-                x0, y0, x1, y1 = result["bbox"]
-                result["bbox"] = (x0 + offset_x, y0 + offset_y, x1 + offset_x, y1 + offset_y)
-                all_results.append(result)
+            # Offset bboxes from sub-tile → parent tile coords
+            for item in sub_results:
+                sx0, sy0, sx1, sy1 = item["bbox"]
+                aggregated.append({
+                    **item,
+                    "bbox": (sx0 + x0, sy0 + y0, sx1 + x0, sy1 + y0),
+                })
 
-        return all_results
-
-    # Tile is within limits - process with appropriate engine
-    if cfg.engine == "qwen-vl":
-        return _ocr_tile_qwen_vl(gray, cfg)
-    elif cfg.engine == "easyocr":
-        return _ocr_tile_easyocr(gray, cfg)
-    else:
-        return _ocr_tile_tesseract(gray, cfg, cfg.upscale_factor, cfg.enable_sharpening)
+    # Deduplicate overlaps from seams
+    return merge_and_deduplicate(aggregated)
 
 
 def _ocr_tile(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
