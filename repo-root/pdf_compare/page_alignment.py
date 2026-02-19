@@ -18,19 +18,19 @@ Example:
         None  → New 7  (F is new)
 """
 
-# TODO: Port alignment helpers to DatabaseBackend; current implementation still expects legacy SQLite schemas.
-
 from __future__ import annotations
-import sqlite3
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 import hashlib
+
+from .db_backend import DatabaseBackend
+from .db_models import Document, GeometryRow
 
 
 # -------------------------
 # Page Fingerprinting
 # -------------------------
 
-def _compute_page_fingerprint(conn: sqlite3.Connection, doc_id: str, page: int) -> dict:
+def _compute_page_fingerprint(backend: DatabaseBackend, doc_id: str, page: int) -> dict:
     """
     Compute a content-based fingerprint for a page.
 
@@ -41,21 +41,21 @@ def _compute_page_fingerprint(conn: sqlite3.Connection, doc_id: str, page: int) 
         - geom_hash: Hash of geometry bounding boxes
         - text_count: Number of text runs
     """
-    # Get all text
-    text_rows = conn.execute(
-        "SELECT text FROM text_rows WHERE doc_id=? AND page_number=? ORDER BY rowid",
-        (doc_id, page)
-    ).fetchall()
+    # Get text via backend helper (returns List[(text, bbox_tuple)])
+    text_data = backend.load_page_texts(doc_id, page)
 
-    full_text = "\n".join(row[0] for row in text_rows)
+    full_text = "\n".join(t for t, _ in text_data)
     text_hash = hashlib.sha256(full_text.encode('utf-8')).hexdigest()[:16]
     text_sample = full_text[:500] if full_text else ""
 
-    # Get geometry stats
-    geom_rows = conn.execute(
-        "SELECT x0, y0, x1, y1 FROM geometry WHERE doc_id=? AND page_number=? ORDER BY rowid",
-        (doc_id, page)
-    ).fetchall()
+    # Get geometry bboxes via session query
+    with backend.read_session() as session:
+        geom_rows = session.query(
+            GeometryRow.x0, GeometryRow.y0, GeometryRow.x1, GeometryRow.y1
+        ).filter(
+            GeometryRow.doc_id == doc_id,
+            GeometryRow.page_number == page
+        ).order_by(GeometryRow.id).all()
 
     geom_bbox_str = ";".join(f"{x0:.2f},{y0:.2f},{x1:.2f},{y1:.2f}" for x0, y0, x1, y1 in geom_rows)
     geom_hash = hashlib.sha256(geom_bbox_str.encode('utf-8')).hexdigest()[:16]
@@ -64,7 +64,7 @@ def _compute_page_fingerprint(conn: sqlite3.Connection, doc_id: str, page: int) 
         "page": page,
         "text_hash": text_hash,
         "text_sample": text_sample,
-        "text_count": len(text_rows),
+        "text_count": len(text_data),
         "geom_hash": geom_hash,
         "geom_count": len(geom_rows),
     }
@@ -110,12 +110,31 @@ def _page_similarity(fp1: dict, fp2: dict) -> float:
     return score
 
 
+def _get_page_counts(
+    backend: DatabaseBackend, old_id: str, new_id: str
+) -> Tuple[int, int]:
+    """Look up page counts for two documents, raising on missing IDs."""
+    with backend.read_session() as session:
+        old_doc = session.get(Document, old_id)
+        new_doc = session.get(Document, new_id)
+
+        if not old_doc or not new_doc:
+            missing = []
+            if not old_doc:
+                missing.append(old_id)
+            if not new_doc:
+                missing.append(new_id)
+            raise ValueError(f"Document(s) not found: {', '.join(missing)}")
+
+        return old_doc.page_count, new_doc.page_count
+
+
 # -------------------------
 # Alignment Algorithms
 # -------------------------
 
 def align_pages_greedy(
-    conn: sqlite3.Connection,
+    backend: DatabaseBackend,
     old_id: str,
     new_id: str,
     similarity_threshold: float = 0.5
@@ -129,20 +148,16 @@ def align_pages_greedy(
     - (None, M, 0.0): Page M was inserted
 
     Args:
+        backend: DatabaseBackend instance
+        old_id: Old document ID
+        new_id: New document ID
         similarity_threshold: Minimum score to consider pages matched (0.0-1.0)
     """
-    # Get page counts
-    old_count = conn.execute(
-        "SELECT page_count FROM documents WHERE doc_id=?", (old_id,)
-    ).fetchone()[0]
-
-    new_count = conn.execute(
-        "SELECT page_count FROM documents WHERE doc_id=?", (new_id,)
-    ).fetchone()[0]
+    old_count, new_count = _get_page_counts(backend, old_id, new_id)
 
     # Compute fingerprints for all pages
-    old_fps = [_compute_page_fingerprint(conn, old_id, p) for p in range(1, old_count + 1)]
-    new_fps = [_compute_page_fingerprint(conn, new_id, p) for p in range(1, new_count + 1)]
+    old_fps = [_compute_page_fingerprint(backend, old_id, p) for p in range(1, old_count + 1)]
+    new_fps = [_compute_page_fingerprint(backend, new_id, p) for p in range(1, new_count + 1)]
 
     # Greedy matching: for each old page, find best new page
     alignments: List[Tuple[Optional[int], Optional[int], float]] = []
@@ -183,7 +198,7 @@ def align_pages_greedy(
 
 
 def align_pages_dynamic(
-    conn: sqlite3.Connection,
+    backend: DatabaseBackend,
     old_id: str,
     new_id: str,
     similarity_threshold: float = 0.5
@@ -198,19 +213,18 @@ def align_pages_dynamic(
         - Deletions: old pages removed
 
     This is more accurate than greedy but slower for large documents.
-    """
-    # Get page counts
-    old_count = conn.execute(
-        "SELECT page_count FROM documents WHERE doc_id=?", (old_id,)
-    ).fetchone()[0]
 
-    new_count = conn.execute(
-        "SELECT page_count FROM documents WHERE doc_id=?", (new_id,)
-    ).fetchone()[0]
+    Args:
+        backend: DatabaseBackend instance
+        old_id: Old document ID
+        new_id: New document ID
+        similarity_threshold: Minimum similarity to consider pages matched (0.0-1.0)
+    """
+    old_count, new_count = _get_page_counts(backend, old_id, new_id)
 
     # Compute fingerprints
-    old_fps = [_compute_page_fingerprint(conn, old_id, p) for p in range(1, old_count + 1)]
-    new_fps = [_compute_page_fingerprint(conn, new_id, p) for p in range(1, new_count + 1)]
+    old_fps = [_compute_page_fingerprint(backend, old_id, p) for p in range(1, old_count + 1)]
+    new_fps = [_compute_page_fingerprint(backend, new_id, p) for p in range(1, new_count + 1)]
 
     # Build similarity matrix
     sim_matrix = []
@@ -295,7 +309,7 @@ def align_pages_dynamic(
 # -------------------------
 
 def align_pages(
-    conn: sqlite3.Connection,
+    backend: DatabaseBackend,
     old_id: str,
     new_id: str,
     method: str = "dynamic",
@@ -305,7 +319,7 @@ def align_pages(
     Align pages between two documents using content-based matching.
 
     Args:
-        conn: Database connection
+        backend: DatabaseBackend instance
         old_id: Old document ID
         new_id: New document ID
         method: "greedy" (faster) or "dynamic" (optimal, default)
@@ -318,19 +332,19 @@ def align_pages(
             - (None, M, 0.0): Page M was inserted
 
     Example:
-        alignments = align_pages(conn, "doc_old", "doc_new")
+        alignments = align_pages(backend, "doc_old", "doc_new")
         for old_pg, new_pg, score in alignments:
             if old_pg and new_pg:
-                print(f"Page {old_pg} → {new_pg} (similarity: {score:.2f})")
+                print(f"Page {old_pg} -> {new_pg} (similarity: {score:.2f})")
             elif old_pg:
                 print(f"Page {old_pg} was DELETED")
             else:
                 print(f"Page {new_pg} was INSERTED")
     """
     if method == "greedy":
-        return align_pages_greedy(conn, old_id, new_id, similarity_threshold)
+        return align_pages_greedy(backend, old_id, new_id, similarity_threshold)
     elif method == "dynamic":
-        return align_pages_dynamic(conn, old_id, new_id, similarity_threshold)
+        return align_pages_dynamic(backend, old_id, new_id, similarity_threshold)
     else:
         raise ValueError(f"Unknown alignment method: {method}. Use 'greedy' or 'dynamic'.")
 

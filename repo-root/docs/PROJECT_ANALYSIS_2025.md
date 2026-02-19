@@ -52,8 +52,7 @@ pdf_compare/
 ├── search_new.py           # Full-text search
 ├── compare_new.py          # Diff algorithms
 ├── overlay.py              # PDF overlay generation
-├── raster_diff.py          # Raster comparison
-├── raster_grid.py          # Grid-based comparison
+├── raster_grid.py          # Consolidated raster comparison (grid + pixel-level)
 ├── cli.py                  # Command-line interface
 ├── analyzers/              # OCR and analysis modules
 │   ├── highres_ocr.py

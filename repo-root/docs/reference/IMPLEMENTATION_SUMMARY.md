@@ -12,8 +12,8 @@
 - Debug tool to visualize why differences are detected
 
 **Files**:
-- `pdf_compare/raster_grid.py` - Fixed implementation
-- `pdf_compare/raster_diff_debug.py` - Debug visualization tool
+- `pdf_compare/raster_grid.py` - Consolidated raster comparison (grid + pixel-level)
+- `pdf_compare/raster_debug.py` - Debug visualization tool
 - `RASTER_COMPARISON_GUIDE.md` - Complete usage guide
 
 ### 2. RAG Symbol Recognition (LLM-Powered Analysis)
@@ -353,8 +353,8 @@ with open("comparison_report.txt", "w") as f:
 
 ```
 pdf_compare/
-├── raster_grid.py      # Fixed raster comparison
-├── raster_diff_debug.py          # Debug tool
+├── raster_grid.py                # Consolidated raster comparison (grid + pixel-level)
+├── raster_debug.py               # Debug visualization tool
 ├── rag_simple.py                 # Simple RAG implementation
 ├── rag_symbol_recognition.py    # Advanced RAG (optional)
 ├── db_backend.py                 # SQLAlchemy backend

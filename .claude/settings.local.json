@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docling-project.github.io)",
+      "WebFetch(domain:arxiv.org)"
+    ]
+  }
+}

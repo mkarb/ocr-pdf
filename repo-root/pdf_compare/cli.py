@@ -187,7 +187,7 @@ def compare_grid(
 
     base = base_pdf or new_pdf
     write_overlay(base, diffs, out_overlay)
-    print(f"Overlay written: {out_overlay}")
+    typer.echo(f"Overlay written: {out_overlay}")
 
 
 @app.command()
@@ -233,9 +233,25 @@ def compare(
     # Proceed with vector/text diff (DB-backed)
     diffs = diff_documents(backend, old_id, new_id)
     typer.echo(f"✅ Compared {len(diffs)} pages.")
-    if out_overlay and base_pdf:
-        write_overlay(base_pdf, diffs, out_overlay)
-        print(f"Wrote overlay to {out_overlay}")
+    if out_overlay:
+        if not base_pdf:
+            # Try to resolve base PDF from the new document's stored path
+            with backend.SessionLocal() as session:
+                from .db_models import Document
+                new_doc = session.get(Document, new_id)
+                if new_doc and new_doc.path and os.path.isfile(new_doc.path):
+                    base_pdf = new_doc.path
+                    typer.echo(f"Using stored PDF path as base: {base_pdf}")
+
+        if base_pdf:
+            write_overlay(base_pdf, diffs, out_overlay)
+            typer.echo(f"Wrote overlay to {out_overlay}")
+        else:
+            typer.echo(
+                "Warning: --out-overlay specified but no --base-pdf provided "
+                "and stored PDF path not found on disk. Skipping overlay.",
+                err=True
+            )
 
 
 @app.command()
@@ -258,7 +274,7 @@ def ocr_augment(
     backend = get_db_connection(db_url)
 
     # Get document info
-    with backend.get_session() as session:
+    with backend.SessionLocal() as session:
         from .db_models import Document, TextRow
         doc = session.query(Document).filter(Document.doc_id == doc_id).first()
         if not doc:
@@ -288,7 +304,7 @@ def ocr_augment(
     typer.echo(f"📄 Running OCR on {len(pages)} pages...")
     cfg = HighResOCRConfig(dpi=dpi, psm=11, min_conf=min_conf, max_workers=6, ram_budget_mb=10240)
 
-    with backend.get_session() as session:
+    with backend.SessionLocal() as session:
         from .db_models import TextRow
         for p in pages:
             runs = highres_ocr(pdf_path, p-1, cfg)
@@ -300,7 +316,7 @@ def ocr_augment(
                     doc_id=doc_id,
                     page_number=p,
                     text=r["text"],
-                    bbox=str(list(r["bbox"])),
+                    bbox=f"[{r['bbox'][0]},{r['bbox'][1]},{r['bbox'][2]},{r['bbox'][3]}]",
                     font=None,
                     size=None,
                     source="ocr"

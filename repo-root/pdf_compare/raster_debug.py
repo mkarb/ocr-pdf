@@ -5,9 +5,10 @@ Helps diagnose why everything is being highlighted.
 
 import numpy as np
 import cv2
-import fitz
 from pathlib import Path
 import matplotlib.pyplot as plt
+
+from .raster_grid import _render_gray
 
 
 def debug_raster_comparison(pdf1_path: str, pdf2_path: str, page_index: int = 0, dpi: int = 400):
@@ -21,21 +22,13 @@ def debug_raster_comparison(pdf1_path: str, pdf2_path: str, page_index: int = 0,
         dpi: Rendering resolution
     """
 
-    # Render both pages
-    def render_page(pdf_path, page_idx, dpi_val):
-        doc = fitz.open(pdf_path)
-        page = doc[page_idx]
-        zoom = dpi_val / 72.0
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-        doc.close()
-        if pix.n == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        return img, zoom
+    img1, zoom = _render_gray(pdf1_path, page_index, dpi)
+    img2, _ = _render_gray(pdf2_path, page_index, dpi)
 
-    img1, zoom = render_page(pdf1_path, page_index, dpi)
-    img2, _ = render_page(pdf2_path, page_index, dpi)
+    # Handle size mismatch between rendered pages
+    if img1.shape[:2] != img2.shape[:2]:
+        print(f"Size mismatch: {img1.shape[:2]} vs {img2.shape[:2]}, resizing img2 to match img1")
+        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]), interpolation=cv2.INTER_LINEAR)
 
     print(f"Image 1 shape: {img1.shape}")
     print(f"Image 2 shape: {img2.shape}")
@@ -116,7 +109,7 @@ def debug_raster_comparison(pdf1_path: str, pdf2_path: str, page_index: int = 0,
     axes[1, 2].axis('off')
 
     plt.tight_layout()
-    output_path = Path('raster_diff_debug.png')
+    output_path = Path('raster_debug.png')
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"\nDiagnostic visualization saved to: {output_path}")
     plt.close()
@@ -145,9 +138,9 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
-        print("Usage: python raster_diff_debug.py <pdf1> <pdf2> [page_index] [dpi]")
+        print("Usage: python -m pdf_compare.raster_debug <pdf1> <pdf2> [page_index] [dpi]")
         print("\nExample:")
-        print("  python raster_diff_debug.py old.pdf new.pdf 0 400")
+        print("  python -m pdf_compare.raster_debug old.pdf new.pdf 0 400")
         sys.exit(1)
 
     pdf1 = sys.argv[1]

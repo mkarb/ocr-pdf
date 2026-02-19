@@ -1,5 +1,8 @@
 """
-Improved raster grid comparison with adaptive alignment, noise reduction, and diagnostics.
+Consolidated raster comparison module.
+
+Provides both grid-based cell analysis (raster_grid_changed_boxes) and
+pixel-level contour detection (raster_diff_boxes) for PDF page comparison.
 """
 
 from __future__ import annotations
@@ -40,6 +43,8 @@ def _align_ecc(base: np.ndarray, mov: np.ndarray, skip_if_similar: bool = True) 
         Aligned image and alignment metrics
     """
     h, w = base.shape[:2]
+    if mov.shape[:2] != (h, w):
+        mov = cv2.resize(mov, (w, h), interpolation=cv2.INTER_LINEAR)
     b = cv2.GaussianBlur(base, (5, 5), 0)
     m = cv2.GaussianBlur(mov, (5, 5), 0)
 
@@ -209,6 +214,71 @@ def _merge_adjacent_boxes(
     return merged
 
 
+def _apply_exclusions(
+    mask: np.ndarray,
+    zoom: float,
+    exclude_boxes_pdf: List[Tuple[float, float, float, float]] | None,
+) -> np.ndarray:
+    """Zero out regions of the diff mask corresponding to excluded PDF-coordinate boxes."""
+    if not exclude_boxes_pdf:
+        return mask
+    H, W = mask.shape[:2]
+    for (x0, y0, x1, y1) in exclude_boxes_pdf:
+        px0, py0, px1, py1 = int(x0 * zoom), int(y0 * zoom), int(x1 * zoom), int(y1 * zoom)
+        px0 = max(0, min(W, px0)); px1 = max(0, min(W, px1))
+        py0 = max(0, min(H, py0)); py1 = max(0, min(H, py1))
+        if px1 > px0 and py1 > py0:
+            mask[py0:py1, px0:px1] = 0
+    return mask
+
+
+def _boxes_from_mask(
+    mask: np.ndarray, min_area: int = 120, merge_gap: int = 6
+) -> List[Tuple[int, int, int, int]]:
+    """Extract bounding boxes from a binary mask using contour detection.
+
+    Args:
+        mask: Binary difference mask
+        min_area: Minimum bounding-box area in pixels to keep
+        merge_gap: Pixel gap for merging nearby boxes
+    """
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if w * h >= min_area:
+            boxes.append((x, y, x + w, y + h))
+    if not boxes:
+        return []
+    boxes.sort()
+    merged: List[Tuple[int, int, int, int]] = []
+
+    def expand(b):
+        bx0, by0, bx1, by1 = b
+        return (bx0 - merge_gap, by0 - merge_gap, bx1 + merge_gap, by1 + merge_gap)
+
+    for b in boxes:
+        bx = expand(b)
+        if not merged:
+            merged.append(bx)
+            continue
+        x0, y0, x1, y1 = bx
+        mx0, my0, mx1, my1 = merged[-1]
+        if not (x1 < mx0 or mx1 < x0 or y1 < my0 or my1 < y0):
+            merged[-1] = (min(mx0, x0), min(my0, y0), max(mx1, x1), max(my1, y1))
+        else:
+            merged.append(bx)
+    return [
+        (x0 + merge_gap, y0 + merge_gap, x1 - merge_gap, y1 - merge_gap)
+        for (x0, y0, x1, y1) in merged
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Grid-based comparison
+# ---------------------------------------------------------------------------
+
+
 def raster_grid_changed_boxes(
     old_pdf_path: str,
     new_pdf_path: str,
@@ -368,3 +438,79 @@ def raster_grid_changed_boxes_aligned(
         min_content_ratio=min_content_ratio,
         return_metrics=return_metrics,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pixel-level (non-grid) comparison
+# ---------------------------------------------------------------------------
+
+
+def raster_diff_boxes(
+    old_pdf: str,
+    new_pdf: str,
+    page_index: int,
+    *,
+    dpi: int = 350,
+    method: str = "hybrid",
+    min_area: int = 120,
+    exclude_boxes_pdf: List[Tuple[float, float, float, float]] | None = None,
+) -> List[Tuple[float, float, float, float]]:
+    """Pixel-level raster diff using contour detection.
+
+    Unlike the grid-based approach, this finds exact bounding boxes around
+    changed regions using cv2.findContours.
+
+    Args:
+        old_pdf: Path to old PDF
+        new_pdf: Path to new PDF
+        page_index: 0-based page index (same for both PDFs)
+        dpi: Render resolution
+        method: "hybrid", "adaptive", "ssim", or "abs"
+        min_area: Minimum change area in pixels
+        exclude_boxes_pdf: Regions to exclude (in PDF coordinates)
+
+    Returns:
+        List of bounding boxes (x0, y0, x1, y1) in PDF coordinates
+    """
+    img_old, zoom = _render_gray(old_pdf, page_index, dpi)
+    img_new, _ = _render_gray(new_pdf, page_index, dpi)
+    img_new_aligned, _ = _align_ecc(img_old, img_new)
+    mask, _ = _mask_diff_adaptive(img_old, img_new_aligned, method=method)
+    mask = _apply_exclusions(mask, zoom, exclude_boxes_pdf)
+    boxes_px = _boxes_from_mask(mask, min_area=min_area)
+    return [(x0 / zoom, y0 / zoom, x1 / zoom, y1 / zoom) for (x0, y0, x1, y1) in boxes_px]
+
+
+def raster_diff_boxes_aligned(
+    old_pdf: str,
+    new_pdf: str,
+    old_page_index: int,
+    new_page_index: int,
+    *,
+    dpi: int = 350,
+    method: str = "hybrid",
+    min_area: int = 120,
+    exclude_boxes_pdf: List[Tuple[float, float, float, float]] | None = None,
+) -> List[Tuple[float, float, float, float]]:
+    """Pixel-level raster diff with different page indices.
+
+    Args:
+        old_pdf: Path to old PDF
+        new_pdf: Path to new PDF
+        old_page_index: 0-based page index in old PDF
+        new_page_index: 0-based page index in new PDF
+        dpi: Render resolution
+        method: "hybrid", "adaptive", "ssim", or "abs"
+        min_area: Minimum change area in pixels
+        exclude_boxes_pdf: Regions to exclude (in PDF coordinates)
+
+    Returns:
+        List of bounding boxes (x0, y0, x1, y1) in PDF coordinates
+    """
+    img_old, zoom = _render_gray(old_pdf, old_page_index, dpi)
+    img_new, _ = _render_gray(new_pdf, new_page_index, dpi)
+    img_new_aligned, _ = _align_ecc(img_old, img_new)
+    mask, _ = _mask_diff_adaptive(img_old, img_new_aligned, method=method)
+    mask = _apply_exclusions(mask, zoom, exclude_boxes_pdf)
+    boxes_px = _boxes_from_mask(mask, min_area=min_area)
+    return [(x0 / zoom, y0 / zoom, x1 / zoom, y1 / zoom) for (x0, y0, x1, y1) in boxes_px]

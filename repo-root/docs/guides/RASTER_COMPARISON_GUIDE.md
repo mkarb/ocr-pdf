@@ -32,7 +32,7 @@ Skips cells that are mostly empty (white space):
 
 #### Debug First
 ```python
-from pdf_compare.raster_diff_debug import debug_raster_comparison
+from pdf_compare.raster_debug import debug_raster_comparison
 
 debug_raster_comparison("old.pdf", "new.pdf", page_index=0)
 # Creates visualization showing why differences are detected
@@ -123,7 +123,7 @@ rows=6, cols=8    # 48 cells
 
 **Diagnosis**:
 ```bash
-python pdf_compare/raster_diff_debug.py old.pdf new.pdf 0
+python -m pdf_compare.raster_debug old.pdf new.pdf 0
 ```
 
 **Common Causes**:
