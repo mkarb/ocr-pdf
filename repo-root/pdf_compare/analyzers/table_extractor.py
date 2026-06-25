@@ -167,8 +167,10 @@ class TableExtractionConfig:
     cell_padding: int = 2
 
     # OCR
-    ocr_psm: int = 6  # Uniform block of text
+    ocr_psm: int = 6  # Uniform block of text (Tesseract)
     ocr_min_conf: int = 50
+    ocr_engine: Optional[str] = None    # "easyocr"|"tesseract"; None=auto (env/CUDA)
+    ocr_use_gpu: Optional[bool] = None  # None=auto (CUDA autodetect for EasyOCR)
 
     # Table classification
     bom_keywords: List[str] = field(default_factory=lambda: [
@@ -391,10 +393,59 @@ def detect_rows_by_whitespace(
 # OCR and Cell Extraction
 # ========================
 
+def _easyocr_cell(cell_gray: np.ndarray, use_gpu: bool) -> Tuple[str, float]:
+    """OCR a single cell crop with EasyOCR (GPU when available)."""
+    from .highres_ocr import _get_easyocr_reader
+
+    reader = _get_easyocr_reader(lang="en", use_gpu=use_gpu)
+    results = reader.readtext(cell_gray, detail=1, paragraph=False)
+
+    texts, confs = [], []
+    for _bbox, text, conf in results:
+        text = text.strip()
+        if text:
+            texts.append(text)
+            confs.append(int(conf * 100))
+
+    if not texts:
+        return "", 0.0
+    return " ".join(texts), sum(confs) / len(confs)
+
+
+def _tesseract_cell(cell_gray: np.ndarray, config: TableExtractionConfig) -> Tuple[str, float]:
+    """OCR a single cell crop with Tesseract."""
+    # Contrast enhancement helps Tesseract on tight cells.
+    cell_gray = cv2.equalizeHist(cell_gray)
+
+    custom_config = f'--psm {config.ocr_psm} --oem 3'
+    data = pytesseract.image_to_data(
+        cell_gray, config=custom_config, output_type=pytesseract.Output.DICT
+    )
+
+    texts, confidences = [], []
+    for i in range(len(data['text'])):
+        text = data['text'][i].strip()
+        try:
+            conf = int(data['conf'][i])
+        except (ValueError, KeyError):
+            conf = 0
+        # Include all text, even low confidence (for table extraction we need all cells)
+        if text:
+            texts.append(text)
+            confidences.append(conf)
+
+    if not texts:
+        return "", 0.0
+    return " ".join(texts), (sum(confidences) / len(confidences) if confidences else 0.0)
+
+
 def extract_cell_text(
     image: np.ndarray,
     cell_bbox: Tuple[int, int, int, int],
-    config: TableExtractionConfig
+    config: TableExtractionConfig,
+    *,
+    engine: Optional[str] = None,
+    use_gpu: bool = False,
 ) -> Tuple[str, float]:
     """
     Extract text from a cell using OCR.
@@ -403,58 +454,32 @@ def extract_cell_text(
         image: Full page image
         cell_bbox: (x, y, w, h) in pixel coordinates
         config: Extraction config
+        engine/use_gpu: resolved OCR engine + GPU flag. If ``engine`` is None
+            they are resolved from the config (env/CUDA autodetect). The
+            extractor resolves once and passes them in to avoid per-cell work.
 
     Returns:
         (text, confidence)
     """
     x, y, w, h = cell_bbox
 
-    # Extract cell region
     cell_img = image[y:y+h, x:x+w]
-
     if cell_img.size == 0:
         return "", 0.0
 
-    # Preprocess cell
     if len(cell_img.shape) == 3:
         cell_gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
     else:
         cell_gray = cell_img.copy()
 
-    # Enhance contrast
-    cell_gray = cv2.equalizeHist(cell_gray)
+    if engine is None:
+        from .highres_ocr import resolve_ocr_engine
+        engine, use_gpu = resolve_ocr_engine(config.ocr_engine, config.ocr_use_gpu)
 
-    # OCR
-    custom_config = f'--psm {config.ocr_psm} --oem 3'
-    data = pytesseract.image_to_data(
-        cell_gray,
-        config=custom_config,
-        output_type=pytesseract.Output.DICT
-    )
-
-    # Combine text with confidence
-    texts = []
-    confidences = []
-
-    for i in range(len(data['text'])):
-        text = data['text'][i].strip()
-        try:
-            conf = int(data['conf'][i])
-        except (ValueError, KeyError):
-            conf = 0
-
-        # Include all text, even low confidence (for table extraction we need all cells)
-        if text:
-            texts.append(text)
-            confidences.append(conf)
-
-    if not texts:
-        return "", 0.0
-
-    combined_text = " ".join(texts)
-    avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-
-    return combined_text, avg_confidence
+    # EasyOCR prefers minimal preprocessing; Tesseract benefits from equalizeHist.
+    if engine == "easyocr":
+        return _easyocr_cell(cell_gray, use_gpu)
+    return _tesseract_cell(cell_gray, config)
 
 
 # ========================
@@ -1109,6 +1134,10 @@ class TableExtractor:
             rows_dict[current_row].append(cell_bbox)
             last_y = y
 
+        # Resolve the OCR engine once per table (avoids per-cell CUDA probing).
+        from .highres_ocr import resolve_ocr_engine
+        cell_engine, cell_gpu = resolve_ocr_engine(self.config.ocr_engine, self.config.ocr_use_gpu)
+
         # Extract text from each cell (including empty cells)
         for row_idx, row_cells in rows_dict.items():
             # Sort cells in row by x-coordinate
@@ -1116,7 +1145,7 @@ class TableExtractor:
 
             for col_idx, cell_bbox in enumerate(row_cells):
                 x, y, w, h = cell_bbox
-                text, conf = extract_cell_text(image, cell_bbox, self.config)
+                text, conf = extract_cell_text(image, cell_bbox, self.config, engine=cell_engine, use_gpu=cell_gpu)
 
                 # Convert back to PDF coordinates
                 pdf_x0 = (offset_x + x) / zoom

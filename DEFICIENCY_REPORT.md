@@ -80,7 +80,8 @@ Context: there are **four independent OCR call sites** — `highres_ocr`/`tiled_
 
 **Resolved this pass:** 5.1 + 5.2 + 5.6 + 5.9 (deleted `enhanced_ocr.py` and `legend_extractor.py` + their `__init__` exports — this removed the pickle-load security hole, the numeric-noise heuristic, and the Canny-on-binary bug along with the dead code), 5.4 (removed the dead `max_workers` param from `tiled_ocr` + its only caller, and the unused `ThreadPoolExecutor` import), 5.5 (EasyOCR readers now cached per `(lang, gpu)`).
 **Resolved in the GPU/OCR-robustness detour:** 2.7 (engine/GPU fallback) and 5.8 (`ensure_vectormap` default) — see the Detour section below.
-**Still open — IN SCOPE for functional high-res OCR on large diagrams:** 5.3 (unify the live OCR engine/preprocessing; also the next GPU win — move `extract_cell_text` off CPU-Tesseract). 5.7 (Tesseract path), 5.10 (`print`→`logging`) are lower-priority polish.
+**Resolved later:** 5.3 cell-OCR (post-merge) — `extract_cell_text` now routes through `resolve_ocr_engine` (EasyOCR+GPU when available, Tesseract fallback); `TableExtractionConfig` gained `ocr_engine`/`ocr_use_gpu`; engine resolved once per table. So BOM/table extraction can use the 5090. Routing covered by `tests/test_table_cell_ocr.py`.
+**Still open:** 5.3-preprocessing (a fully unified render/preprocess abstraction across all OCR sites remains a larger refactor), 5.7 (Tesseract path), 5.10 (`print`→`logging`) — lower-priority polish.
 
 ---
 
