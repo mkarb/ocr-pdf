@@ -150,6 +150,7 @@ class TableExtractionConfig:
     """Configuration for table extraction."""
     # Rendering
     dpi: int = 400
+    max_render_pixels: int = 8000  # cap whole-page renders so large sheets don't OOM
 
     # Line detection (for bordered tables)
     enable_line_detection: bool = True
@@ -209,6 +210,22 @@ class TableExtractionConfig:
 # ========================
 # Line Detection
 # ========================
+
+def _capped_dpi(page_w: float, page_h: float, dpi: int, max_px: int) -> float:
+    """
+    Reduce DPI so a whole-page render's longest side stays <= max_px.
+
+    Table *detection* and whole-page fallback OCR don't need full DPI on a giant
+    sheet; output coords are PDF-space (pixel / zoom) so the result is unchanged.
+    Known table regions are still rendered at full DPI via a clip (see
+    ``extract_table``), so cell OCR stays sharp.
+    """
+    zoom = dpi / 72.0
+    longest = max(page_w, page_h) * zoom
+    if longest <= max_px:
+        return float(dpi)
+    return max(1.0, dpi * (max_px / longest))
+
 
 def detect_table_lines(
     image: np.ndarray,
@@ -968,10 +985,10 @@ class TableExtractor:
         Returns:
             List of bounding boxes in PDF coordinates
         """
-        # Render page
+        # Render page (capped DPI - detection is region-level, not cell OCR)
         doc = fitz.open(pdf_path)
         page = doc[page_index]
-        zoom = self.config.dpi / 72.0
+        zoom = _capped_dpi(page.rect.width, page.rect.height, self.config.dpi, self.config.max_render_pixels) / 72.0
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
@@ -1065,25 +1082,30 @@ class TableExtractor:
             if table_from_vectors:
                 return table_from_vectors
 
-        # Render page for legacy detection / OCR fallback
+        # Render only what's needed so large sheets don't OOM:
+        #  - known table_bbox -> render just that region at full DPI (sharp cells)
+        #  - whole page (auto-detect) -> cap the DPI so the pixmap stays bounded
         doc = fitz.open(pdf_path)
         page = doc[page_index]
-        zoom = self.config.dpi / 72.0
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-        doc.close()
 
-        # If bbox provided, crop to region
         if table_bbox:
+            zoom = self.config.dpi / 72.0
             x0, y0, x1, y1 = table_bbox
-            px0, py0 = int(x0 * zoom), int(y0 * zoom)
-            px1, py1 = int(x1 * zoom), int(y1 * zoom)
-            image = image[py0:py1, px0:px1]
-            offset_x, offset_y = px0, py0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, clip=fitz.Rect(x0, y0, x1, y1), alpha=False)
+            image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+            # Offset is the region's top-left in full-page pixel space, so the
+            # downstream `(offset + cell_px) / zoom` mapping yields PDF coords.
+            offset_x, offset_y = int(x0 * zoom), int(y0 * zoom)
         else:
+            zoom = _capped_dpi(page.rect.width, page.rect.height, self.config.dpi, self.config.max_render_pixels) / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
             offset_x, offset_y = 0, 0
             table_bbox = (0, 0, pix.w / zoom, pix.h / zoom)
+
+        doc.close()
 
         # Detect table structure
         h_lines, v_lines = detect_table_lines(image, self.config)
