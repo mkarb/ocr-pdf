@@ -18,7 +18,7 @@ except Exception:
     HAVE_SKIMAGE = False
 
 
-def _render_gray(pdf_path: str, page_index: int, dpi: int) -> tuple[np.ndarray, float]:
+def _render_gray(pdf_path: str, page_index: int, dpi: float) -> tuple[np.ndarray, float]:
     """Render PDF page as grayscale image."""
     doc = fitz.open(pdf_path)
     page = doc[page_index]
@@ -30,6 +30,32 @@ def _render_gray(pdf_path: str, page_index: int, dpi: int) -> tuple[np.ndarray, 
     if pix.n == 3:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     return img, zoom
+
+
+def _page_size(pdf_path: str, page_index: int) -> tuple[float, float]:
+    """Return (width, height) in PDF points for a page."""
+    doc = fitz.open(pdf_path)
+    try:
+        r = doc[page_index].rect
+        return r.width, r.height
+    finally:
+        doc.close()
+
+
+def _capped_dpi(page_w: float, page_h: float, dpi: int, max_px: int) -> float:
+    """
+    Reduce DPI so the rendered image's longest side stays <= max_px.
+
+    Change-detection output boxes are PDF-space (pixel / zoom), so lowering the
+    render DPI does not move the result's coordinates — it just keeps a large
+    E-size sheet from producing a multi-hundred-MB pixmap and an intractable ECC
+    alignment on a ~17000x11000 image.
+    """
+    zoom = dpi / 72.0
+    longest = max(page_w, page_h) * zoom
+    if longest <= max_px:
+        return float(dpi)
+    return max(1.0, dpi * (max_px / longest))
 
 
 def _align_ecc(base: np.ndarray, mov: np.ndarray, skip_if_similar: bool = True) -> tuple[np.ndarray, Dict[str, Any]]:
@@ -228,6 +254,7 @@ def raster_grid_changed_boxes(
     skip_empty_cells: bool = True,
     white_threshold: int = 250,
     min_content_ratio: float = 0.10,
+    max_render_pixels: int = 8000,
     return_metrics: bool = False,
 ) -> (
     List[Tuple[float, float, float, float]]
@@ -251,11 +278,23 @@ def raster_grid_changed_boxes(
         skip_empty_cells: Skip mostly-empty cells to reduce noise
         white_threshold: Pixel value considered white for content detection
         min_content_ratio: Minimum ratio of content pixels to process a cell
+        max_render_pixels: Cap the rendered image's longest side (large sheets
+            are detected at a lower effective DPI; output boxes are unaffected)
         return_metrics: Return diagnostics
     """
-    img_old, zoom = _render_gray(old_pdf_path, page_index, dpi)
     new_idx = page_index if new_page_index is None else new_page_index
-    img_new, _ = _render_gray(new_pdf_path, new_idx, dpi)
+
+    # Cap render resolution so large sheets don't OOM / stall ECC alignment.
+    # Use one effective DPI for both pages so the images stay pixel-aligned.
+    ow, oh = _page_size(old_pdf_path, page_index)
+    nw, nh = _page_size(new_pdf_path, new_idx)
+    eff_dpi = min(
+        _capped_dpi(ow, oh, dpi, max_render_pixels),
+        _capped_dpi(nw, nh, dpi, max_render_pixels),
+    )
+
+    img_old, zoom = _render_gray(old_pdf_path, page_index, eff_dpi)
+    img_new, _ = _render_gray(new_pdf_path, new_idx, eff_dpi)
 
     if np.array_equal(img_old, img_new):
         metrics = {
@@ -313,6 +352,7 @@ def raster_grid_changed_boxes(
 
     metrics = {
         "identical": False,
+        "render_dpi": round(eff_dpi, 1),
         "alignment": align_metrics,
         "diff_detection": diff_metrics,
         "boxes_found": len(boxes),
@@ -346,6 +386,7 @@ def raster_grid_changed_boxes_aligned(
     skip_empty_cells: bool = True,
     white_threshold: int = 250,
     min_content_ratio: float = 0.10,
+    max_render_pixels: int = 8000,
     return_metrics: bool = False,
 ) -> (
     List[Tuple[float, float, float, float]]
@@ -369,5 +410,6 @@ def raster_grid_changed_boxes_aligned(
         skip_empty_cells=skip_empty_cells,
         white_threshold=white_threshold,
         min_content_ratio=min_content_ratio,
+        max_render_pixels=max_render_pixels,
         return_metrics=return_metrics,
     )
