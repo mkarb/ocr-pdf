@@ -1,5 +1,7 @@
 import typer
 import os
+import json
+from typing import Callable, Optional
 from .pdf_extract import pdf_to_vectormap
 from .db_backend import DatabaseBackend
 from .store_new import upsert_vectormap, list_documents
@@ -7,7 +9,7 @@ from .search_new import search_text as search_text_fts
 from .compare_new import diff_documents
 from .overlay import write_overlay
 from .raster_grid import raster_grid_changed_boxes
-from .analyzers.highres_ocr import highres_ocr, HighResOCRConfig
+from .analyzers.highres_ocr import highres_ocr, HighResOCRConfig, resolve_ocr_engine
 import fitz
 
 app = typer.Typer(add_completion=False)
@@ -37,6 +39,76 @@ def get_db_connection(db_url: str | None = None):
 
     return DatabaseBackend(url)
 
+
+def _run_ocr_augment(
+    backend: DatabaseBackend,
+    doc_id: str,
+    *,
+    dpi: int = 500,
+    min_conf: int = 60,
+    only_sparse: bool = True,
+    echo: Optional[Callable[[str], None]] = None,
+) -> int:
+    """
+    Add OCR text runs to an existing document. Shared by the `ocr-augment` and
+    `compare --with-ocr` commands.
+
+    Re-runnable: existing OCR rows for the target pages are cleared first so
+    repeated runs don't accumulate duplicates. Returns the number of pages OCR'd.
+    Raises ValueError if the document isn't found.
+    """
+    from .db_models import Document, TextRow
+
+    with backend.get_session() as session:
+        doc = session.query(Document).filter(Document.doc_id == doc_id).first()
+        if not doc:
+            raise ValueError(f"Document {doc_id} not found")
+        pdf_path = doc.path
+        page_count = doc.page_count
+
+        pages = list(range(1, page_count + 1))
+        if only_sparse:
+            pages = [
+                p for p in pages
+                if session.query(TextRow).filter(
+                    TextRow.doc_id == doc_id, TextRow.page_number == p
+                ).count() < 5  # heuristic: little/no native text
+            ]
+
+    if not pages:
+        return 0
+
+    ocr_engine, ocr_gpu = resolve_ocr_engine()
+    if echo:
+        echo(f"📄 Running OCR on {len(pages)} page(s) (engine={ocr_engine}, gpu={ocr_gpu})...")
+    cfg = HighResOCRConfig(dpi=dpi, psm=11, min_conf=min_conf, engine=ocr_engine, use_gpu=ocr_gpu, max_workers=6, ram_budget_mb=10240)
+
+    with backend.get_session() as session:
+        # Clear prior OCR rows for these pages (idempotent re-runs)
+        for p in pages:
+            session.query(TextRow).filter(
+                TextRow.doc_id == doc_id, TextRow.page_number == p, TextRow.source == "ocr"
+            ).delete(synchronize_session=False)
+
+        for p in pages:
+            runs = highres_ocr(pdf_path, p - 1, cfg)
+            if echo:
+                echo(f"  Page {p}/{page_count}: {len(runs)} OCR spans")
+            for r in runs:
+                session.add(TextRow(
+                    doc_id=doc_id,
+                    page_number=p,
+                    text=r["text"],
+                    bbox=json.dumps(list(r["bbox"])),
+                    font=None,
+                    size=None,
+                    source="ocr",
+                ))
+        session.commit()
+
+    return len(pages)
+
+
 @app.command()
 def ingest(
     pdf: str,
@@ -46,22 +118,30 @@ def ingest(
         False,
         "--server",
         help="Use server-optimized extraction (no Streamlit compatibility, better performance)"
-    )
+    ),
+    enable_ocr: bool = typer.Option(False, "--ocr", help="Run OCR on pages with sparse native text"),
+    ocr_engine: str | None = typer.Option(None, "--ocr-engine", help="easyocr|tesseract (default: auto-detect/GPU)"),
+    ocr_dpi: int = typer.Option(400, "--ocr-dpi", help="OCR rendering DPI (tiled for large pages)"),
 ):
     """
     Ingest a PDF into the PostgreSQL database.
 
     Use --server flag for server/Docker deployments (faster, no Streamlit compatibility).
+    Use --ocr to OCR pages with little embedded text (engineering scans/drawings).
 
     Example:
         export DATABASE_URL=postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare
-        compare-pdf-revs ingest document.pdf
+        compare-pdf-revs ingest document.pdf --ocr
     """
-    if use_server_mode or os.getenv("PDF_SERVER_MODE"):
+    # Server mode has no OCR; route to the client extractor when --ocr is requested.
+    if (use_server_mode or os.getenv("PDF_SERVER_MODE")) and not enable_ocr:
         from .pdf_extract_server import pdf_to_vectormap_server
         vm = pdf_to_vectormap_server(pdf, doc_id=doc_id)
     else:
-        vm = pdf_to_vectormap(pdf, doc_id=doc_id)
+        vm = pdf_to_vectormap(
+            pdf, doc_id=doc_id,
+            enable_ocr=enable_ocr, ocr_dpi=ocr_dpi, ocr_engine=ocr_engine,
+        )
 
     backend = get_db_connection(db_url)
     upsert_vectormap(backend, vm)
@@ -150,24 +230,16 @@ def compare(
 
     # --- OCR augment knobs ---
     with_ocr: bool = typer.Option(False, help="Run OCR augment on NEW doc before vector/text diff"),
-    ocr_mode: str = typer.Option("sparse", help="sparse|all|changed-cells"),
+    ocr_mode: str = typer.Option("sparse", help="sparse (only text-poor pages) | all (every page)"),
     ocr_dpi: int = 500,
     ocr_min_conf: int = 60,
-    ocr_psm: int = 11,
-
-    # --- parameters used when ocr_mode == 'changed-cells' ---
-    changed_cells_dpi: int = 400,
-    changed_cells_rows: int = 12,
-    changed_cells_cols: int = 16,
-    changed_cells_ratio: float = 0.03,
 ):
     """
     Vector/Text compare using PostgreSQL database. Optionally OCR the NEW document first.
 
     ocr_mode:
-      - sparse        -> OCR only pages with very little native text (fast)
-      - all           -> OCR every page
-      - changed-cells -> Use raster grid to find changed regions, OCR only those tiles (fast + focused)
+      - sparse -> OCR only pages with very little native text (fast)
+      - all    -> OCR every page
 
     Example:
         export DATABASE_URL=postgresql://pdfuser:pdfpassword@localhost:5432/pdfcompare
@@ -176,9 +248,19 @@ def compare(
     backend = get_db_connection(db_url)
 
     if with_ocr:
-        typer.echo("⚠️  OCR augmentation with PostgreSQL backend not yet implemented in CLI.")
-        typer.echo("    Use the Streamlit UI or run ocr-augment command separately.")
-        typer.echo("    Proceeding with comparison without OCR...\n")
+        if ocr_mode not in ("sparse", "all"):
+            typer.echo(f"❌ Invalid --ocr-mode '{ocr_mode}'. Use 'sparse' or 'all'.", err=True)
+            raise typer.Exit(code=1)
+        try:
+            n = _run_ocr_augment(
+                backend, new_id,
+                dpi=ocr_dpi, min_conf=ocr_min_conf,
+                only_sparse=(ocr_mode == "sparse"), echo=typer.echo,
+            )
+            typer.echo(f"✅ OCR augment on {new_id}: {n} page(s)\n" if n else "ℹ️  No pages needed OCR.\n")
+        except ValueError as exc:
+            typer.echo(f"❌ {exc}", err=True)
+            raise typer.Exit(code=1)
 
     # Proceed with vector/text diff (DB-backed)
     diffs = diff_documents(backend, old_id, new_id)
@@ -207,58 +289,19 @@ def ocr_augment(
     """
     backend = get_db_connection(db_url)
 
-    # Get document info
-    with backend.get_session() as session:
-        from .db_models import Document, TextRow
-        doc = session.query(Document).filter(Document.doc_id == doc_id).first()
-        if not doc:
-            typer.echo(f"❌ Document {doc_id} not found", err=True)
-            raise typer.Exit(code=1)
+    try:
+        n = _run_ocr_augment(
+            backend, doc_id,
+            dpi=dpi, min_conf=min_conf, only_sparse=only_sparse, echo=typer.echo,
+        )
+    except ValueError as exc:
+        typer.echo(f"❌ {exc}", err=True)
+        raise typer.Exit(code=1)
 
-        pdf_path = doc.path
-        page_count = doc.page_count
-
-        # Determine which pages to OCR
-        pages = list(range(1, page_count + 1))
-        if only_sparse:
-            sparse = []
-            for p in pages:
-                n = session.query(TextRow).filter(
-                    TextRow.doc_id == doc_id,
-                    TextRow.page_number == p
-                ).count()
-                if n < 5:  # heuristic
-                    sparse.append(p)
-            pages = sparse
-
-    if not pages:
+    if n == 0:
         typer.echo("ℹ️  No pages need OCR.")
-        return
-
-    typer.echo(f"📄 Running OCR on {len(pages)} pages...")
-    cfg = HighResOCRConfig(dpi=dpi, psm=11, min_conf=min_conf, max_workers=6, ram_budget_mb=10240)
-
-    with backend.get_session() as session:
-        from .db_models import TextRow
-        for p in pages:
-            runs = highres_ocr(pdf_path, p-1, cfg)
-            typer.echo(f"  Page {p}/{page_count}: {len(runs)} OCR spans")
-
-            # Insert OCR text runs
-            for r in runs:
-                text_row = TextRow(
-                    doc_id=doc_id,
-                    page_number=p,
-                    text=r["text"],
-                    bbox=str(list(r["bbox"])),
-                    font=None,
-                    size=None,
-                    source="ocr"
-                )
-                session.add(text_row)
-            session.commit()
-
-    typer.echo(f"✅ OCR augment complete for {doc_id}")
+    else:
+        typer.echo(f"✅ OCR augment complete for {doc_id} ({n} page(s))")
 
 
 if __name__ == "__main__":

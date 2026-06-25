@@ -3,18 +3,39 @@ Simple RAG implementation for PDF analysis using Ollama.
 Simplified version optimized for symbol recognition and diagram analysis.
 """
 
-from pathlib import Path
 from typing import Optional, List, Dict, Any
 import os
 import json
 
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.llms import Ollama
+from langchain_ollama import OllamaEmbeddings, OllamaLLM
 from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+
+
+def _extract_json(text: str) -> Optional[dict]:
+    """
+    Best-effort extraction of a JSON object from an LLM response.
+
+    Models often wrap JSON in prose or ```json fences, so a bare json.loads
+    usually fails. Try a direct parse, then fall back to the outermost {...} span.
+    """
+    if not text:
+        return None
+    cleaned = text.strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(cleaned[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
 class SimplePDFChat:
@@ -61,7 +82,7 @@ class SimplePDFChat:
         print("Vector store created")
 
         # Create LLM
-        self.llm = Ollama(model=llm_model, base_url=self.base_url)
+        self.llm = OllamaLLM(model=llm_model, base_url=self.base_url)
 
         # Create retrieval chain
         self.qa_chain = RetrievalQA.from_chain_type(
@@ -102,14 +123,14 @@ class SimplePDFChat:
         """
         response = self.ask(question)
 
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            return {
-                "symbols": [],
-                "raw_response": response,
-                "error": "Failed to parse JSON"
-            }
+        parsed = _extract_json(response)
+        if parsed is not None:
+            return parsed
+        return {
+            "symbols": [],
+            "raw_response": response,
+            "error": "Failed to parse JSON"
+        }
 
     def extract_page_names(self) -> List[str]:
         """Extract names/titles of all pages."""
@@ -150,7 +171,7 @@ class SymbolComparator:
             llm_model: Ollama model to use
         """
         self.base_url = base_url or os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434"
-        self.llm = Ollama(model=llm_model, base_url=self.base_url)
+        self.llm = OllamaLLM(model=llm_model, base_url=self.base_url)
         self.pdf1_chat = SimplePDFChat(pdf1_path, llm_model, base_url=self.base_url)
         self.pdf2_chat = SimplePDFChat(pdf2_path, llm_model, base_url=self.base_url)
 
@@ -224,15 +245,15 @@ class SymbolComparator:
 
         response = self.llm.invoke(prompt)
 
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            return {
-                "are_same": False,
-                "confidence": 0.0,
-                "reasoning": "Failed to parse response",
-                "raw_response": response
-            }
+        parsed = _extract_json(response)
+        if parsed is not None:
+            return parsed
+        return {
+            "are_same": False,
+            "confidence": 0.0,
+            "reasoning": "Failed to parse response",
+            "raw_response": response
+        }
 
 
 # Quick helper functions

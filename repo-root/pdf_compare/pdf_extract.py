@@ -1,8 +1,6 @@
 # pdf_compare/pdf_extract.py
 from __future__ import annotations
-from typing import List, Tuple, Dict, Any, Optional
-from dataclasses import asdict
-import hashlib
+from typing import List, Dict, Any, Optional
 import os
 from pathlib import Path
 
@@ -16,14 +14,11 @@ from .worker_pool import (
 
 configure_thread_env()
 
-import numpy as np
 import fitz  # PyMuPDF
-from shapely.geometry import LineString, Polygon, box
-from shapely.ops import unary_union
-from shapely.wkb import dumps as wkb_dumps
 
+from ._extract_core import hash_file as _hash_file, drawings_to_geoms as _drawings_to_geoms
 from .models import (
-    VectorMap, DocMeta, PageVectors, VectorGeom, GeoKind, TextRun, BBox
+    VectorMap, DocMeta, PageVectors, VectorGeom, GeoKind, text_run_from_dict
 )
 
 # -----------------------
@@ -44,96 +39,11 @@ DEF_SIMPLIFY_TOL    = None     # e.g., 0.05..0.15 to reduce oversampled paths
 # -----------------------
 # Helpers
 # -----------------------
-def _hash_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()[:16]
+# Geometry helpers (_hash_file, _drawings_to_geoms) live in _extract_core and are
+# imported above so pdf_extract.py and pdf_extract_server.py share one implementation.
 
 
-def _cubic_sample(p0, p1, p2, p3, n: int) -> List[Tuple[float, float]]:
-    """Sample a cubic Bezier curve with n points."""
-    t = np.linspace(0.0, 1.0, n)
-    xs = (1 - t) ** 3 * p0[0] + 3 * (1 - t) ** 2 * t * p1[0] + 3 * (1 - t) * t ** 2 * p2[0] + t ** 3 * p3[0]
-    ys = (1 - t) ** 3 * p0[1] + 3 * (1 - t) ** 2 * t * p1[1] + 3 * (1 - t) * t ** 2 * p2[1] + t ** 3 * p3[1]
-    return list(zip(xs.tolist(), ys.tolist()))
-
-
-def _adaptive_bezier_samples(p0, p1, p2, p3, base_samples: int) -> int:
-    """
-    Calculate adaptive sample count based on curve's bounding box diagonal.
-    Longer curves get more samples; short curves get fewer.
-    """
-    # Estimate curve extent via control point bounding box
-    xs = [p0[0], p1[0], p2[0], p3[0]]
-    ys = [p0[1], p1[1], p2[1], p3[1]]
-    diagonal = np.hypot(max(xs) - min(xs), max(ys) - min(ys))
-
-    # Scale samples: 1 sample per ~2 units of diagonal length, min 4, max base_samples
-    samples = max(4, min(base_samples, int(diagonal / 2) + 1))
-    return samples
-
-
-def _drawings_to_geoms(
-    page: "fitz.Page",
-    min_segment_len: float,
-    min_fill_area: float,
-    bezier_samples: int,
-    simplify_tolerance: Optional[float],
-) -> List[Dict[str, Any]]:
-    """
-    Extract stroke/fill geometries from a page and return as plain dicts ready for IPC.
-    Each dict: {"kind": "STROKE"|"FILL", "wkb": bytes, "bbox": (x0,y0,x1,y1)}
-    """
-    out: List[Dict[str, Any]] = []
-
-    for d in page.get_drawings():
-        # strokes (path segments)
-        for item in d["items"]:
-            op = item[0]
-            if op == "l":  # line (p0, p1)
-                _, p0, p1 = item
-                if p0 != p1:
-                    ls = LineString([p0, p1])
-                    if simplify_tolerance:
-                        ls = ls.simplify(simplify_tolerance, preserve_topology=True)
-                    if ls.length >= min_segment_len and not ls.is_empty:
-                        out.append({
-                            "kind": "STROKE",
-                            "wkb": wkb_dumps(ls),
-                            "bbox": ls.bounds,
-                        })
-            elif op == "c":  # cubic Bezier (p0,p1,p2,p3)
-                _, p0, p1, p2, p3 = item
-                # Use adaptive sampling: short curves get fewer samples
-                n_samples = _adaptive_bezier_samples(p0, p1, p2, p3, bezier_samples)
-                pts = _cubic_sample(p0, p1, p2, p3, n=n_samples)
-                ls = LineString(pts)
-                if simplify_tolerance:
-                    ls = ls.simplify(simplify_tolerance, preserve_topology=True)
-                if ls.length >= min_segment_len and not ls.is_empty:
-                    out.append({
-                        "kind": "STROKE",
-                        "wkb": wkb_dumps(ls),
-                        "bbox": ls.bounds,
-                    })
-
-        # simple rect fill
-        if d.get("fill") and d.get("rect"):
-            x0, y0, x1, y1 = d["rect"]
-            poly = box(x0, y0, x1, y1)
-            if poly.area >= min_fill_area and not poly.is_empty:
-                out.append({
-                    "kind": "FILL",
-                    "wkb": wkb_dumps(poly),
-                    "bbox": poly.bounds,
-                })
-
-    return out
-
-
-def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index: Optional[int] = None, enable_ocr: bool = False, ocr_dpi: int = 400) -> List[Dict[str, Any]]:
+def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index: Optional[int] = None, enable_ocr: bool = False, ocr_dpi: int = 400, ocr_engine: Optional[str] = None, ocr_use_gpu: Optional[bool] = None) -> List[Dict[str, Any]]:
     """
     Extract native text spans as plain dicts: {"text": str, "bbox": (x0,y0,x1,y1), "font": str|None, "size": float|None}
     Optionally runs OCR if enable_ocr=True and minimal native text is found.
@@ -159,7 +69,12 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
     # Run OCR if enabled and little native text was found
     if enable_ocr and len(runs) < 20 and pdf_path and page_index is not None:
         try:
-            from .analyzers import highres_ocr, tiled_ocr, HighResOCRConfig
+            from .analyzers import highres_ocr, tiled_ocr, HighResOCRConfig, resolve_ocr_engine
+
+            # Resolve engine + GPU: explicit caller choice (e.g. the UI dropdown) wins,
+            # then OCR_ENGINE/OCR_USE_GPU env, then CUDA autodetect; falls back to
+            # Tesseract if EasyOCR isn't installed so OCR still runs on a non-GPU host.
+            resolved_engine, resolved_gpu = resolve_ocr_engine(ocr_engine, ocr_use_gpu)
 
             # Get page dimensions
             page_width = page.rect.width
@@ -178,7 +93,7 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
             import sys
             if needs_tiling:
                 # Use tiled OCR for large pages
-                print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using tiled OCR at {dpi} DPI (page too large for single tile)", file=sys.stderr)
+                print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using tiled OCR at {dpi} DPI (page too large for single tile), engine={resolved_engine} gpu={resolved_gpu}", file=sys.stderr)
 
                 ocr_results, report = tiled_ocr(
                     pdf_path=pdf_path,
@@ -188,20 +103,19 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
                     min_conf=50,  # Lowered from 60 to capture more text (some may be lower confidence)
                     overlap_pct=0.35,  # Increased from 0.20 to better capture text at boundaries
                     skip_empty=True,
-                    max_workers=1,  # Serial in Streamlit
                     return_report=True,
                     use_dual_psm=True,  # Use both PSM 11 and PSM 6 for better text capture (Tesseract only)
-                    engine="easyocr",   # Use EasyOCR for better accuracy on small text
-                    use_gpu=True        # Enable GPU acceleration
+                    engine=resolved_engine,
+                    use_gpu=resolved_gpu,
                 )
 
                 print(f"OCR: page {page_index+1}: Tiled OCR complete - {report.tiles_processed}/{report.total_tiles} tiles processed, {report.tiles_skipped_empty} skipped, {len(ocr_results)} text items, {report.duplicates_removed} duplicates removed", file=sys.stderr)
 
             else:
                 # Use whole-page OCR for pages that fit
-                print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using whole-page OCR at {dpi} DPI", file=sys.stderr)
+                print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using whole-page OCR at {dpi} DPI, engine={resolved_engine} gpu={resolved_gpu}", file=sys.stderr)
 
-                config = HighResOCRConfig(dpi=dpi, psm=11, min_conf=50, engine="easyocr", use_gpu=True)
+                config = HighResOCRConfig(dpi=dpi, psm=11, min_conf=50, engine=resolved_engine, use_gpu=resolved_gpu)
                 ocr_results = highres_ocr(pdf_path, page_index, config)
 
                 print(f"OCR: page {page_index+1}: Extracted {len(ocr_results)} text items", file=sys.stderr)
@@ -237,6 +151,8 @@ def _extract_page_job(
     simplify_tolerance: Optional[float],
     enable_ocr: bool = False,
     ocr_dpi: int = 400,
+    ocr_engine: Optional[str] = None,
+    ocr_use_gpu: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Isolated worker: Extract one page → return pure Python dict.
@@ -254,7 +170,7 @@ def _extract_page_job(
         bezier_samples=bezier_samples,
         simplify_tolerance=simplify_tolerance,
     )
-    texts = _extract_text(pg, pdf_path=pdf_path, page_index=page_index, enable_ocr=enable_ocr, ocr_dpi=ocr_dpi)
+    texts = _extract_text(pg, pdf_path=pdf_path, page_index=page_index, enable_ocr=enable_ocr, ocr_dpi=ocr_dpi, ocr_engine=ocr_engine, ocr_use_gpu=ocr_use_gpu)
 
     out = {
         "page_number": page_index + 1,
@@ -281,7 +197,9 @@ def pdf_to_vectormap(
     bezier_samples: int = DEF_BEZIER_SAMPLES,
     simplify_tolerance: Optional[float] = DEF_SIMPLIFY_TOL,
     enable_ocr: bool = False,                 # Enable OCR for engineering drawings
-    ocr_dpi: int = 400,                       # User-requested DPI for OCR (will be auto-capped)
+    ocr_dpi: int = 400,                       # DPI for OCR rendering (tiled OCR splits oversized pages)
+    ocr_engine: Optional[str] = None,         # "easyocr"|"tesseract"; None=auto (env/CUDA)
+    ocr_use_gpu: Optional[bool] = None,       # None=auto (CUDA autodetect for EasyOCR)
 ) -> VectorMap:
     """
     Parallel, high-throughput ingest.
@@ -348,6 +266,8 @@ def pdf_to_vectormap(
                     simplify_tolerance=simplify_tolerance,
                     enable_ocr=enable_ocr,
                     ocr_dpi=ocr_dpi,
+                    ocr_engine=ocr_engine,
+                    ocr_use_gpu=ocr_use_gpu,
                 )
             )
     else:
@@ -364,6 +284,8 @@ def pdf_to_vectormap(
                     simplify_tolerance,
                     enable_ocr,
                     ocr_dpi,
+                    ocr_engine,
+                    ocr_use_gpu,
                 )
 
             page_dicts = pool.submit_throttled(
@@ -384,15 +306,7 @@ def pdf_to_vectormap(
             )
             for g in r["geoms"]
         ]
-        texts_dc = [
-            TextRun(
-                text=t["text"],
-                bbox=tuple(t["bbox"]),
-                font=t.get("font"),
-                size=t.get("size"),
-            )
-            for t in r["texts"]
-        ]
+        texts_dc = [text_run_from_dict(t) for t in r["texts"]]
         pages.append(
             PageVectors(
                 page_number=r["page_number"],

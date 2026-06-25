@@ -180,33 +180,36 @@ def _detect_content_regions(
 def _merge_adjacent_boxes(
     boxes: List[Tuple[float, float, float, float]]
 ) -> List[Tuple[float, float, float, float]]:
-    """Merge touching or overlapping boxes."""
+    """
+    Merge touching or overlapping boxes until stable.
+
+    Unlike a single-pass merge against only the previous box, this repeatedly
+    absorbs any box that touches the growing region, so chains and overlaps
+    that aren't adjacent in sort order are still merged.
+    """
     if not boxes:
         return boxes
 
-    boxes = sorted(boxes)
-    merged: List[Tuple[float, float, float, float]] = []
+    remaining = [tuple(b) for b in boxes]
+    out: List[Tuple[float, float, float, float]] = []
 
-    for box in boxes:
-        if not merged:
-            merged.append(box)
-            continue
+    while remaining:
+        x0, y0, x1, y1 = remaining.pop()
+        absorbed = True
+        while absorbed:
+            absorbed = False
+            keep: List[Tuple[float, float, float, float]] = []
+            for bx0, by0, bx1, by1 in remaining:
+                touch = not (x1 < bx0 or bx1 < x0 or y1 < by0 or by1 < y0)
+                if touch:
+                    x0, y0, x1, y1 = min(x0, bx0), min(y0, by0), max(x1, bx1), max(y1, by1)
+                    absorbed = True
+                else:
+                    keep.append((bx0, by0, bx1, by1))
+            remaining = keep
+        out.append((x0, y0, x1, y1))
 
-        x0, y0, x1, y1 = box
-        mx0, my0, mx1, my1 = merged[-1]
-        touch = not (x1 < mx0 or mx1 < x0 or y1 < my0 or my1 < y0)
-
-        if touch:
-            merged[-1] = (
-                min(mx0, x0),
-                min(my0, y0),
-                max(mx1, x1),
-                max(my1, y1),
-            )
-        else:
-            merged.append(box)
-
-    return merged
+    return out
 
 
 def raster_grid_changed_boxes(

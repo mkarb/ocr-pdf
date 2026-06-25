@@ -1,6 +1,5 @@
 """
-SQLAlchemy models for PDF comparison database.
-Supports both SQLite and PostgreSQL backends.
+SQLAlchemy models for PDF comparison database (PostgreSQL backend).
 """
 
 from sqlalchemy import Column, String, Integer, Float, Text, ForeignKey, Index, LargeBinary
@@ -72,7 +71,7 @@ class TextRow(Base):
     doc_id = Column(String, ForeignKey("documents.doc_id", ondelete="CASCADE"), nullable=False)
     page_number = Column(Integer, nullable=False)
     text = Column(Text, nullable=False)
-    bbox = Column(Text)  # JSON string for SQLite, JSONB for PostgreSQL
+    bbox = Column(Text)  # JSON-encoded [x0, y0, x1, y1]
     font = Column(Text)
     size = Column(Float)
     source = Column(String, default="native")  # 'native' or 'ocr'

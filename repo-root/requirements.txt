@@ -6,7 +6,7 @@ rtree>=1.2.0,<1.5
 numpy>=1.26,<3
 pillow>=10.3,<12
 typer>=0.12,<1.0
-streamlit>=1.32,<1.51
+streamlit>=1.49,<1.51
 threadpoolctl>=3.1.0,<4.0
 
 # Raster processing and OCR (required for raster_diff, raster_grid, and OCR features)

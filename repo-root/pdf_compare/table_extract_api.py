@@ -58,13 +58,18 @@ def ensure_vectormap(
     page_numbers: Optional[Sequence[int]] = None,
     regenerate_if_missing: bool = True,
     workers: int = 1,
-    enable_ocr: bool = True,
+    enable_ocr: bool = False,
 ) -> Tuple[Optional[object], bool]:
     """
     Ensure a vectormap exists for the requested document.
 
     Returns the vectormap (or ``None``) and a boolean indicating whether a new
     extraction was performed.
+
+    ``enable_ocr`` defaults to ``False``: table extraction relies on vector
+    geometry plus its own per-cell OCR, so regenerating a missing vectormap does
+    not need the full (potentially GPU) OCR pass. Opt in explicitly if you also
+    want an OCR'd text layer stored for the document.
     """
     resolved_path = str(Path(doc_path))
     normalized_pages = _coerce_page_numbers(page_numbers)

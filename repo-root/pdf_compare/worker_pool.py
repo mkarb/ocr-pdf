@@ -6,7 +6,6 @@ This module provides robust worker pool utilities with:
 - Thread explosion prevention (BLAS/OpenMP limiting)
 - Memory leak prevention (document cache cleanup)
 - Throttled future submission to bound memory usage
-- Automatic retry with reduced workers on crashes
 - Detailed error context for debugging
 
 Usage:

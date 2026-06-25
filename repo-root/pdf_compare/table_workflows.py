@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from .db_backend import DatabaseBackend
-from .table_extractor import extract_tables
+from .table_extract_api import extract_tables
 from .analyzers.table_extractor import Table, TableExtractionConfig
 
 

@@ -43,10 +43,10 @@ venv.bak/
 .coverage
 htmlcov/
 
-# User data and uploads
-repo-root/uploads/
-repo-root/outputs/
-repo-root/data/
+# User data, uploads, and generated artifacts (match at any depth)
+uploads/
+outputs/
+data/
 
 # Database files
 *.db

@@ -5,9 +5,9 @@ Local PDF vector extraction, search, and revision diff tool with OCR support.
 ## Features
 
 - **Vector Extraction**: Extract geometric shapes and text from PDFs using PyMuPDF
-- **Text Search**: Full-text search using SQLite FTS5
+- **Text Search**: Full-text search using PostgreSQL full-text search (tsvector/GIN)
 - **Revision Diff**: Compare PDF revisions with visual overlays showing changes
-- **OCR Support**: High-resolution OCR using Tesseract for scanned documents
+- **OCR Support**: High-resolution tiled OCR using EasyOCR (GPU, auto-detected) or Tesseract, for scanned/large drawings
 - **Raster Comparison**: Grid-based and pixel-level comparison with alignment
 - **Streamlit UI**: Interactive web interface for document management
 - **CLI Tools**: Command-line interface for automation
