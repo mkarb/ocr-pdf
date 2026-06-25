@@ -69,56 +69,22 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
     # Run OCR if enabled and little native text was found
     if enable_ocr and len(runs) < 20 and pdf_path and page_index is not None:
         try:
-            from .analyzers import highres_ocr, tiled_ocr, HighResOCRConfig, resolve_ocr_engine
-
-            # Resolve engine + GPU: explicit caller choice (e.g. the UI dropdown) wins,
-            # then OCR_ENGINE/OCR_USE_GPU env, then CUDA autodetect; falls back to
-            # Tesseract if EasyOCR isn't installed so OCR still runs on a non-GPU host.
-            resolved_engine, resolved_gpu = resolve_ocr_engine(ocr_engine, ocr_use_gpu)
-
-            # Get page dimensions
-            page_width = page.rect.width
-            page_height = page.rect.height
-
-            # Use user-requested DPI (no capping here - tiled OCR handles it)
-            dpi = ocr_dpi
-
-            # Check if tiling is needed at requested DPI
-            TESSERACT_PIXEL_LIMIT = 29000
-            zoom = dpi / 72.0
-            pixel_width = page_width * zoom
-            pixel_height = page_height * zoom
-            needs_tiling = (pixel_width > TESSERACT_PIXEL_LIMIT or pixel_height > TESSERACT_PIXEL_LIMIT)
-
             import sys
-            if needs_tiling:
-                # Use tiled OCR for large pages
-                print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using tiled OCR at {dpi} DPI (page too large for single tile), engine={resolved_engine} gpu={resolved_gpu}", file=sys.stderr)
+            from .analyzers.highres_ocr import ocr_page
 
-                ocr_results, report = tiled_ocr(
-                    pdf_path=pdf_path,
-                    page_index=page_index,
-                    dpi=dpi,
-                    psm=11,
-                    min_conf=50,  # Lowered from 60 to capture more text (some may be lower confidence)
-                    overlap_pct=0.35,  # Increased from 0.20 to better capture text at boundaries
-                    skip_empty=True,
-                    return_report=True,
-                    use_dual_psm=True,  # Use both PSM 11 and PSM 6 for better text capture (Tesseract only)
-                    engine=resolved_engine,
-                    use_gpu=resolved_gpu,
-                )
-
-                print(f"OCR: page {page_index+1}: Tiled OCR complete - {report.tiles_processed}/{report.total_tiles} tiles processed, {report.tiles_skipped_empty} skipped, {len(ocr_results)} text items, {report.duplicates_removed} duplicates removed", file=sys.stderr)
-
-            else:
-                # Use whole-page OCR for pages that fit
-                print(f"OCR: page {page_index+1} size={page_width:.0f}x{page_height:.0f} pts: Using whole-page OCR at {dpi} DPI, engine={resolved_engine} gpu={resolved_gpu}", file=sys.stderr)
-
-                config = HighResOCRConfig(dpi=dpi, psm=11, min_conf=50, engine=resolved_engine, use_gpu=resolved_gpu)
-                ocr_results = highres_ocr(pdf_path, page_index, config)
-
-                print(f"OCR: page {page_index+1}: Extracted {len(ocr_results)} text items", file=sys.stderr)
+            # ocr_page resolves the engine/GPU (UI choice > env > CUDA autodetect,
+            # Tesseract fallback) and auto-tiles oversized pages so large diagrams
+            # never get rendered as one giant pixmap.
+            ocr_results = ocr_page(
+                pdf_path,
+                page_index,
+                dpi=ocr_dpi,
+                engine=ocr_engine,
+                use_gpu=ocr_use_gpu,
+                min_conf=50,
+                psm=11,
+            )
+            print(f"OCR: page {page_index+1}: {len(ocr_results)} text item(s)", file=sys.stderr)
 
             # Add OCR results to runs
             for ocr_text in ocr_results:

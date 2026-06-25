@@ -282,14 +282,29 @@ class ThrottledPoolExecutor:
 
         # Process results and refill queue
         completed_count = 0
+        empty_waits = 0
+        MAX_EMPTY_WAITS = 3  # 3 x 300s = 15 min of no progress before aborting
         while in_flight:
             # Wait for at least one future to complete (with timeout)
             done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED, timeout=300)
 
             if not done:
-                # Timeout - log warning but continue
-                logger.warning(f"Timeout waiting for work completion after 300s ({completed_count}/{total_items} done)")
+                # No progress in this window. Bound the number of empty waits so a
+                # genuinely wedged worker (e.g. OCR stuck on a pathological page)
+                # aborts with context instead of spinning forever.
+                empty_waits += 1
+                logger.warning(
+                    f"No worker progress after {empty_waits * 300}s "
+                    f"({completed_count}/{total_items} done, {len(in_flight)} in flight)"
+                )
+                if empty_waits >= MAX_EMPTY_WAITS:
+                    raise RuntimeError(
+                        f"Worker pool stalled: no progress for {MAX_EMPTY_WAITS * 300}s "
+                        f"with {len(in_flight)} task(s) in flight ({completed_count}/{total_items} done)"
+                    )
                 continue
+
+            empty_waits = 0  # progress made; reset the stall counter
 
             for fut in done:
                 item_idx = in_flight.pop(fut)

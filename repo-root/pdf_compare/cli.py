@@ -9,7 +9,7 @@ from .search_new import search_text as search_text_fts
 from .compare_new import diff_documents
 from .overlay import write_overlay
 from .raster_grid import raster_grid_changed_boxes
-from .analyzers.highres_ocr import highres_ocr, HighResOCRConfig, resolve_ocr_engine
+from .analyzers.highres_ocr import ocr_page, resolve_ocr_engine
 import fitz
 
 app = typer.Typer(add_completion=False)
@@ -81,7 +81,6 @@ def _run_ocr_augment(
     ocr_engine, ocr_gpu = resolve_ocr_engine()
     if echo:
         echo(f"📄 Running OCR on {len(pages)} page(s) (engine={ocr_engine}, gpu={ocr_gpu})...")
-    cfg = HighResOCRConfig(dpi=dpi, psm=11, min_conf=min_conf, engine=ocr_engine, use_gpu=ocr_gpu, max_workers=6, ram_budget_mb=10240)
 
     with backend.get_session() as session:
         # Clear prior OCR rows for these pages (idempotent re-runs)
@@ -91,7 +90,8 @@ def _run_ocr_augment(
             ).delete(synchronize_session=False)
 
         for p in pages:
-            runs = highres_ocr(pdf_path, p - 1, cfg)
+            # ocr_page auto-tiles large pages (so ocr-augment works on big sheets).
+            runs = ocr_page(pdf_path, p - 1, dpi=dpi, engine=ocr_engine, use_gpu=ocr_gpu, min_conf=min_conf, psm=11)
             if echo:
                 echo(f"  Page {p}/{page_count}: {len(runs)} OCR spans")
             for r in runs:

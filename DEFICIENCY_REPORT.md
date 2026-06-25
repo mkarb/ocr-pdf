@@ -5,7 +5,31 @@ Generated as a section-by-section audit. Severity legend:
 
 **Project goal (active):** clean up the project to a functional state for **high-resolution OCR on large engineering diagrams**. Not pivoting. Handwriting OCR is a possible future, separate channel — out of scope now. Prioritize fixes that make the existing extraction → store → OCR → tables/search/overlay path work end to end.
 
-Section status: all 10 sections reviewed; fixes applied per section (see each section's "Resolved this pass"). Changes staged in git, not committed.
+Section status: all 10 sections reviewed; fixes applied per section (see each section's "Resolved this pass"). Pass 1 merged (PRs #1, #2). **Second pass below** — adversarial/correctness focus on the large-diagram OCR path.
+
+---
+
+## Second Pass — correctness on large diagrams
+
+**Resolved this pass:** S1 (new shared `highres_ocr.ocr_page()` auto-tiles oversized pages; both `pdf_extract._extract_text` and CLI `_run_ocr_augment` now route through it, so `ocr-augment`/`compare --with-ocr` work on large sheets and the duplicate OCR-a-page logic is gone — tests in `tests/test_ocr_page.py`), S2 (bounded `submit_throttled` stall detection — aborts with context after 3×300 s of no progress instead of looping forever).
+**Still open:** S3 (raster-compare whole-page render/ECC on large sheets), S4 (surface swallowed OCR errors), S5 (configurable OCR threshold).
+
+### S1 🔴 `ocr-augment` / `compare --with-ocr` don't tile large pages → OOM / Tesseract limit
+The ingest OCR path (`pdf_extract._extract_text`) checks `needs_tiling` and calls `tiled_ocr` for big pages. But `_run_ocr_augment` (CLI `ocr-augment` **and** `compare --with-ocr`) calls `highres_ocr(...)`, which renders the **whole page** at `cfg.dpi` (`_render_page_gray`) with no size check. On a large E-size sheet at 500 DPI that pixmap is ~150–500 MB and exceeds Tesseract's ~32,767-px hard limit → the augment path fails or OOMs on exactly the diagrams that are the project's purpose. (You said tiling is the key — and one of the two OCR entry points skips it.)
+- **Fix:** factor a shared `ocr_page(...)` in `highres_ocr` that auto-tiles (the ingest logic), and route both `pdf_extract._extract_text` and `_run_ocr_augment` through it. Removes the duplicate OCR-a-page logic too.
+
+### S2 🟡 `submit_throttled` can hang forever on a stuck worker (revisit of 2.6)
+The `wait(..., timeout=300)` branch only logs and `continue`s. If a worker genuinely wedges (e.g. an OCR worker on a pathological page), the loop spins every 300 s indefinitely with no abort. On big parallel OCR jobs that's a real hang.
+- **Fix:** bound consecutive empty waits (e.g. 3) then raise with context.
+
+### S3 🟡 Raster compare renders + ECC-aligns the whole page (`raster_grid._render_gray`)
+`raster_grid_changed_boxes` renders both pages whole at `dpi` (400) and runs `cv2.findTransformECC` on the full image. For a large sheet that's a multi-hundred-MB pair plus an ECC solve on a ~17000×11000 image — very slow and memory-heavy, and ECC can fail to converge at that size. The `compare-grid` CLI path is impractical on large diagrams without downscaling the alignment step.
+
+### S4 🟡 OCR failures are swallowed silently (large-page UX)
+`_extract_text` wraps the whole OCR block in `except Exception` → prints a traceback to **stderr** and returns only native text. Combined with S1, a large-page OCR failure looks like "document has no text" in the UI with no surfaced error. Worth surfacing the failure (and it interacts with 7.4's missing progress).
+
+### S5 🟢 Native-text OCR threshold is a fixed `< 20` spans
+`_extract_text` only OCRs when a page has `< 20` native spans. A scanned drawing whose title block carries ≥20 native spans but whose body is raster will skip OCR entirely. The threshold is arbitrary/uncongurable.
 
 ---
 

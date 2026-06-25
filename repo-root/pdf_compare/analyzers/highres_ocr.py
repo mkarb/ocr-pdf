@@ -830,3 +830,54 @@ def tiled_ocr(
         return deduplicated_results, report
     else:
         return deduplicated_results
+
+
+def ocr_page(
+    pdf_path: str,
+    page_index: int,
+    *,
+    dpi: int = 400,
+    engine: Optional[str] = None,
+    use_gpu: Optional[bool] = None,
+    min_conf: int = 50,
+    psm: int = 11,
+    max_tile_pixels: int = 29000,
+    overlap_pct: float = 0.35,
+) -> List[Dict]:
+    """
+    OCR a single page, auto-tiling oversized pages.
+
+    This is the single entry point both the ingest pipeline and the CLI
+    ocr-augment path use, so large engineering sheets never get rendered as one
+    giant pixmap (which would blow past Tesseract's pixel limit / OOM). Pages
+    that fit are OCR'd whole; larger ones are split via ``tiled_ocr``.
+
+    Returns a list of ``{"text": str, "bbox": (x0, y0, x1, y1)}`` in PDF coords.
+    """
+    eng, gpu = resolve_ocr_engine(engine, use_gpu)
+
+    doc = fitz.open(pdf_path)
+    page = doc[page_index]
+    page_w, page_h = page.rect.width, page.rect.height
+    doc.close()
+
+    zoom = dpi / 72.0
+    needs_tiling = (page_w * zoom > max_tile_pixels) or (page_h * zoom > max_tile_pixels)
+
+    if needs_tiling:
+        results = tiled_ocr(
+            pdf_path,
+            page_index,
+            dpi=dpi,
+            psm=psm,
+            min_conf=min_conf,
+            overlap_pct=overlap_pct,
+            skip_empty=True,
+            use_dual_psm=(eng == "tesseract"),
+            engine=eng,
+            use_gpu=gpu,
+        )
+        return [{"text": r["text"], "bbox": r["bbox"]} for r in results]
+
+    cfg = HighResOCRConfig(dpi=dpi, psm=psm, min_conf=min_conf, engine=eng, use_gpu=gpu)
+    return highres_ocr(pdf_path, page_index, cfg)
