@@ -89,7 +89,7 @@ services:
   # OLLAMA AI SERVICE
   # ========================================================================
   ollama:
-    image: ollama/ollama:rocm
+    image: ollama/ollama:latest   # CUDA-capable image (NVIDIA)
     container_name: pdf-compare-ollama
     ports:
       - "11434:11434"
@@ -99,16 +99,6 @@ services:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_NUM_PARALLEL=4
       - OLLAMA_MAX_LOADED_MODELS=2
-      - ROCM_VISIBLE_DEVICES=all
-    devices:
-      - /dev/kfd
-      - /dev/dri
-    group_add:
-      - video
-    cap_add:
-      - SYS_PTRACE
-    security_opt:
-      - seccomp=unconfined
     shm_size: 1g
     healthcheck:
       test: ["CMD", "ollama", "list"]
@@ -118,16 +108,22 @@ services:
     restart: unless-stopped
     networks:
       - pdf-network
+    # NVIDIA GPU passthrough (requires the NVIDIA Container Toolkit on the host)
     deploy:
       resources:
         limits:
-          memory: 4g
+          memory: 8g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   # ========================================================================
   # OLLAMA INITIALIZATION
   # ========================================================================
   ollama-init:
-    image: ollama/ollama:rocm
+    image: ollama/ollama:latest
     container_name: pdf-compare-ollama-init
     depends_on:
       ollama:
@@ -202,13 +198,12 @@ services:
         reservations:
           cpus: '3'
           memory: 4g
-        # GPU support for EasyOCR (requires nvidia-docker)
-        # Uncomment to enable GPU acceleration:
-        # reservations:
-        #   devices:
-        #     - driver: nvidia
-        #       count: 1
-        #       capabilities: [gpu]
+          # NVIDIA GPU for EasyOCR (requires the NVIDIA Container Toolkit on the host).
+          # The OCR engine resolver auto-detects CUDA and uses EasyOCR+GPU.
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     shm_size: 512mb  # Shared memory for image processing
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]

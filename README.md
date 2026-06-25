@@ -7,7 +7,7 @@ Intelligent PDF comparison and analysis tool for engineering diagrams with AI-po
 ### Core Capabilities
 - **Vector Extraction**: Fast parallel extraction of lines, curves, fills, and text from PDFs
 - **Raster Comparison**: Grid-based pixel comparison with adaptive thresholding and white space skipping
-- **Database Storage**: PostgreSQL or SQLite backend with spatial indexing
+- **Database Storage**: PostgreSQL backend with spatial indexing
 - **Streamlit UI**: Interactive web interface with real-time progress tracking
 - **Multi-core Processing**: Configurable parallel processing (up to 16 workers)
 
@@ -40,9 +40,9 @@ ollama pull nomic-embed-text
 ### 3. Test the System
 
 ```powershell
-# Test RAG/AI features
+# Test RAG/AI features (optional; requires Ollama)
 cd repo-root
-python test_rag.py your_diagram.pdf
+python tools/test_rag.py your_diagram.pdf
 
 # Run Streamlit UI
 streamlit run ui/streamlit_app.py
@@ -91,11 +91,12 @@ ocr-pdf/
 ├── repo-root/
 │   ├── pdf_compare/           # Core extraction and comparison
 │   │   ├── pdf_extract_server.py    # Multi-core PDF extraction
-│   │   ├── raster_grid_improved.py  # Optimized raster comparison
+│   │   ├── raster_grid.py           # Optimized raster comparison
 │   │   ├── rag_simple.py            # AI/RAG integration
-│   │   └── db_backend.py            # Database abstraction
+│   │   └── db_backend.py            # PostgreSQL backend
 │   ├── ui/                    # Streamlit web interface
-│   ├── test_rag.py           # Test suite for AI features
+│   ├── tests/                 # Pytest unit suite
+│   ├── tools/                 # Manual demo/benchmark scripts
 │   └── requirements.txt       # Python dependencies
 ```
 
@@ -108,10 +109,8 @@ CPU_LIMIT=15                    # Max worker processes
 PDF_MIN_SEGMENT_LEN=0.50       # Min line segment length
 PDF_BEZIER_SAMPLES=24          # Bezier curve sampling
 
-# Database
+# Database (PostgreSQL required)
 DATABASE_URL=postgresql://user:pass@host:5432/pdfcompare
-# or
-DATABASE_URL=sqlite:///./data/comparisons.db
 
 # Ollama
 OLLAMA_HOST=http://localhost:11434
@@ -145,7 +144,6 @@ OLLAMA_HOST=http://localhost:11434
 **Reference:**
 - [Quick Reference](repo-root/docs/reference/QUICK_REFERENCE.md) - Commands and troubleshooting
 - [Implementation Summary](repo-root/docs/reference/IMPLEMENTATION_SUMMARY.md) - Technical details
-- [Database Comparison](repo-root/docs/reference/DATABASE_COMPARISON.md) - SQLite vs PostgreSQL
 
 ## Performance
 
@@ -162,8 +160,8 @@ OLLAMA_HOST=http://localhost:11434
 ## Docker Deployment
 
 ```powershell
-# Build and run with PostgreSQL
-docker-compose -f docker-compose-postgres.yml up
+# Build and run the full stack (PostgreSQL + Ollama + app)
+docker-compose -f docker-compose-full.yml up
 
 # Access UI at http://localhost:8501
 ```

@@ -11,10 +11,14 @@ dependencies = [
   "numpy>=1.26,<3",
   "pillow>=10.3,<12",
   "typer>=0.12,<1.0",
-  "streamlit>=1.32,<1.51",
+  "streamlit>=1.49,<1.51",
+  "threadpoolctl>=3.1.0,<4.0",
   "opencv-python>=4.8,<5.0",
   "pytesseract>=0.3.10,<0.4",
+  "easyocr>=1.7.0,<2.0",
   "scikit-image>=0.21.0,<0.26",
+  "rapidfuzz>=3.0.0,<4.0",
+  "pandas>=2.0.0,<3.0",
   "pikepdf>=8.0.0,<10.0",
   "sqlalchemy>=2.0.0,<2.1",
   "alembic>=1.13.0,<1.14",
@@ -38,6 +42,10 @@ compare-pdf-revs = "pdf_compare.cli:app"   # exposes the Typer CLI
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+# Only collect the real unit suite; the scripts under tools/ are manual demos.
+testpaths = ["tests"]
 
 [tool.setuptools]
 packages = ["pdf_compare", "pdf_compare.analyzers"]

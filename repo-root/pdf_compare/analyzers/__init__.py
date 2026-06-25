@@ -1,6 +1,4 @@
-from .highres_ocr import HighResOCRConfig, highres_ocr, tiled_ocr
-from .enhanced_ocr import EnhancedOCRConfig, SymbolLibrary, enhanced_ocr
-from .legend_extractor import LegendEntry, LegendExtractor, validate_ocr_against_legend
+from .highres_ocr import HighResOCRConfig, highres_ocr, tiled_ocr, resolve_ocr_engine
 from .table_extractor import (
     TableCell,
     TableRow,
@@ -14,14 +12,7 @@ __all__ = [
     "HighResOCRConfig",
     "highres_ocr",
     "tiled_ocr",
-    # Enhanced OCR
-    "EnhancedOCRConfig",
-    "SymbolLibrary",
-    "enhanced_ocr",
-    # Legend extraction
-    "LegendEntry",
-    "LegendExtractor",
-    "validate_ocr_against_legend",
+    "resolve_ocr_engine",
     # Table extraction
     "TableCell",
     "TableRow",

@@ -8,7 +8,6 @@ import os
 import pytesseract
 import time
 import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 if os.name == "nt" and "tesseract.exe" not in pytesseract.pytesseract.tesseract_cmd.lower():
     default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -26,11 +25,51 @@ except ImportError:
 try:
     import easyocr
     HAVE_EASYOCR = True
-    # Initialize EasyOCR reader (lazy loading, only when needed)
-    _EASYOCR_READER = None
 except ImportError:
     HAVE_EASYOCR = False
-    _EASYOCR_READER = None
+
+# Lazy-initialized EasyOCR readers keyed by (language, gpu) so different
+# language/GPU requests don't collide on a single shared reader.
+_EASYOCR_READERS: Dict[Tuple[str, bool], Any] = {}
+
+
+def _gpu_available() -> bool:
+    """Best-effort CUDA availability check (used to auto-select EasyOCR GPU mode)."""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def resolve_ocr_engine(
+    engine: Optional[str] = None,
+    use_gpu: Optional[bool] = None,
+) -> Tuple[str, bool]:
+    """
+    Resolve the OCR engine and GPU flag, honoring env overrides and falling back
+    to whatever is actually installed/available so OCR never fails silently.
+
+    Engine: explicit arg > ``OCR_ENGINE`` env > EasyOCR-if-installed else
+    Tesseract. If EasyOCR is requested but not installed, falls back to Tesseract.
+    GPU: explicit arg > ``OCR_USE_GPU`` env > CUDA autodetection (EasyOCR only).
+    """
+    requested = (engine or os.getenv("OCR_ENGINE") or ("easyocr" if HAVE_EASYOCR else "tesseract")).lower()
+    if requested == "easyocr" and not HAVE_EASYOCR:
+        import sys
+        print("OCR: EasyOCR not installed; falling back to Tesseract", file=sys.stderr)
+        requested = "tesseract"
+
+    if use_gpu is not None:
+        resolved_gpu = bool(use_gpu)
+    else:
+        env_gpu = os.getenv("OCR_USE_GPU")
+        if env_gpu is not None:
+            resolved_gpu = env_gpu.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            resolved_gpu = _gpu_available() if requested == "easyocr" else False
+
+    return requested, resolved_gpu
 
 BBox = Tuple[float, float, float, float]  # x0,y0,x1,y1 in PDF user space
 
@@ -121,9 +160,7 @@ def _render_page_gray(pdf_path: str, page_index: int, dpi: int) -> tuple[np.ndar
     return gray, zoom
 
 def _get_easyocr_reader(lang: str = "en", use_gpu: bool = True):
-    """Get or initialize EasyOCR reader (singleton pattern for efficiency)."""
-    global _EASYOCR_READER
-
+    """Get or initialize the EasyOCR reader for a given (language, gpu) pair."""
     if not HAVE_EASYOCR:
         raise ImportError("EasyOCR not installed. Install with: pip install easyocr")
 
@@ -143,15 +180,17 @@ def _get_easyocr_reader(lang: str = "en", use_gpu: bool = True):
         "ara": "ar"
     }
     easyocr_lang = lang_map.get(lang, lang)
+    key = (easyocr_lang, bool(use_gpu))
 
-    # Initialize reader if not already done
-    if _EASYOCR_READER is None:
+    reader = _EASYOCR_READERS.get(key)
+    if reader is None:
         import sys
         print(f"OCR: Initializing EasyOCR reader (lang={easyocr_lang}, GPU={'enabled' if use_gpu else 'disabled'})...", file=sys.stderr)
-        _EASYOCR_READER = easyocr.Reader([easyocr_lang], gpu=use_gpu)
+        reader = easyocr.Reader([easyocr_lang], gpu=use_gpu)
+        _EASYOCR_READERS[key] = reader
         print(f"OCR: EasyOCR reader initialized", file=sys.stderr)
 
-    return _EASYOCR_READER
+    return reader
 
 
 def _ocr_tile_easyocr(gray: np.ndarray, cfg: HighResOCRConfig) -> List[Dict]:
@@ -643,7 +682,6 @@ def tiled_ocr(
     overlap_pct: float = 0.20,
     skip_empty: bool = True,
     min_content_pct: float = 0.01,
-    max_workers: int = 1,
     return_report: bool = False,
     use_dual_psm: bool = True,  # Try both PSM 11 and PSM 6 (Tesseract only)
     engine: str = "tesseract",  # OCR engine: "tesseract" or "easyocr"
@@ -662,7 +700,6 @@ def tiled_ocr(
         overlap_pct: Overlap between tiles (0.15-0.40 recommended)
         skip_empty: Skip tiles with minimal content
         min_content_pct: Minimum content ratio to process tile
-        max_workers: Number of parallel workers (1 = serial)
         return_report: Return diagnostic report with results
         use_dual_psm: If True, runs both PSM 11 and PSM 6, merges results (Tesseract only)
         engine: OCR engine to use ("tesseract" or "easyocr")

@@ -98,6 +98,9 @@ def run_checks() -> dict:
         ('streamlit', 'Streamlit (UI)'),
         ('cv2', 'OpenCV (raster comparison)'),
         ('pytesseract', 'Tesseract (OCR)'),
+        ('easyocr', 'EasyOCR (GPU OCR)'),
+        ('pandas', 'pandas (table export)'),
+        ('rapidfuzz', 'RapidFuzz (fuzzy match)'),
         ('sqlalchemy', 'SQLAlchemy (database)'),
     ]
 
@@ -156,17 +159,23 @@ def print_summary(results: dict):
     """Print summary and next steps."""
     print_header("Summary")
 
-    all_ok = all(results.values())
+    # Core OCR/diagram functionality only needs Python + core packages.
+    # Ollama and the RAG packages are optional (chat/symbol features).
+    core_ok = bool(results.get('python') and results.get('core_packages'))
+    rag_ok = bool(results.get('rag_packages') and results.get('ollama')
+                  and results.get('llm_model') and results.get('embed_model'))
 
-    if all_ok:
-        print("\n✓ All checks passed! System is ready to use.\n")
-        print("Next steps:")
-        print("  1. Test RAG with a PDF:")
-        print("     python test_rag.py your_diagram.pdf")
-        print("\n  2. Launch Streamlit UI:")
+    if core_ok:
+        print("\n✓ Core checks passed! OCR/diagram features are ready to use.")
+        if not rag_ok:
+            print("ℹ Optional RAG/Ollama components are incomplete — the chat/symbol")
+            print("  features will be unavailable, but OCR, search, diff, and table")
+            print("  extraction work without them.")
+        print("\nNext steps:")
+        print("  1. Launch Streamlit UI:")
         print("     streamlit run ui/streamlit_app.py")
-        print("\n  3. Try interactive PDF chat:")
-        print("     python pdf_compare/rag_simple.py your_diagram.pdf")
+        print("\n  2. (Optional) Test RAG with a PDF:")
+        print("     python tools/test_rag.py your_diagram.pdf")
         return True
     else:
         print("\n× Some components are missing. Follow the instructions below:\n")

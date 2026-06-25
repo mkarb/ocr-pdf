@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import time
 from typing import Any, Dict, Optional
-from functools import wraps
 
 import streamlit as st
 
@@ -118,56 +117,6 @@ class SessionManager:
             session_key = f"user_{key}"
             if session_key not in st.session_state:
                 st.session_state[session_key] = value
-
-    @staticmethod
-    def get_session_info() -> Dict[str, Any]:
-        """
-        Get information about the current session.
-
-        Returns:
-            Dictionary with session metadata
-        """
-        return {
-            "session_id": SessionManager.get_session_id(),
-            "state_keys": [k for k in st.session_state.keys() if k.startswith("user_")],
-            "state_size": len(st.session_state),
-        }
-
-
-def session_cached(cache_key: Optional[str] = None):
-    """
-    Decorator to cache function results in user session state.
-
-    Args:
-        cache_key: Optional custom cache key (uses function name if not provided)
-
-    Example:
-        @session_cached("expensive_computation")
-        def compute_something(param):
-            return expensive_operation(param)
-    """
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            # Generate cache key
-            key = cache_key or f"cached_{func.__name__}"
-
-            # Create a unique key based on arguments
-            arg_hash = hashlib.md5(str((args, kwargs)).encode()).hexdigest()[:8]
-            full_key = f"{key}_{arg_hash}"
-
-            # Check if result is cached
-            cached_result = SessionManager.get_user_state(full_key)
-            if cached_result is not None:
-                return cached_result
-
-            # Compute and cache result
-            result = func(*args, **kwargs)
-            SessionManager.set_user_state(full_key, result)
-            return result
-
-        return wrapper
-    return decorator
 
 
 def isolate_session_state():

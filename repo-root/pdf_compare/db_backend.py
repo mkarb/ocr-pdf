@@ -11,9 +11,9 @@ import random
 from contextlib import contextmanager
 from collections import defaultdict
 
-from sqlalchemy import create_engine, text, select, delete
+from sqlalchemy import create_engine, text, delete
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import QueuePool, StaticPool
+from sqlalchemy.pool import QueuePool
 
 from .db_models import Base, Document, Page, GeometryRow, TextRow, Meta
 from .models import VectorMap, GeoKind, VectorGeom, TextRun, PageVectors, DocMeta
@@ -35,86 +35,62 @@ class DatabaseBackend:
         Initialize database backend.
 
         Args:
-            database_url: Database connection string
-                - PostgreSQL: "postgresql://user:pass@host:port/dbname"
-                - SQLite: "sqlite:///path/to/file.db" (for local dev/testing)
+            database_url: PostgreSQL connection string
+                "postgresql://user:pass@host:port/dbname"
             read_replica_urls: Optional list of PostgreSQL read replicas
             pool_size: Connection pool size for primary engine
             max_overflow: Overflow connections for pool
             pool_pre_ping: Enable SQLAlchemy connection pre-ping
 
         Raises:
-            ValueError: If database_url is not supported
+            ValueError: If database_url is not a PostgreSQL URL
         """
         self.database_url = database_url
         self.read_replica_urls = list(read_replica_urls or [])
-        self.is_postgres = database_url.startswith("postgresql")
-        self.is_sqlite = database_url.startswith("sqlite")
 
-        if not (self.is_postgres or self.is_sqlite):
+        if not database_url.startswith("postgresql"):
             raise ValueError(
-                f"Unsupported database URL. Expected PostgreSQL or SQLite, got: {database_url[:32]}..."
+                f"Unsupported database URL. Expected PostgreSQL (postgresql://...), got: {database_url[:32]}..."
             )
 
         # Primary engine (read/write)
-        if self.is_sqlite:
-            self.write_engine = create_engine(
-                database_url,
-                connect_args={"check_same_thread": False},
-                poolclass=StaticPool,
-                echo=False,
-            )
-            # Enable WAL for better concurrency
-            with self.write_engine.connect() as conn:
-                try:
-                    conn.execute(text("PRAGMA journal_mode=WAL"))
-                    conn.execute(text("PRAGMA foreign_keys=ON"))
-                    conn.commit()
-                except Exception:
-                    # Some SQLite builds may not support WAL commits
-                    pass
-        else:
-            self.write_engine = create_engine(
-                database_url,
+        self.write_engine = create_engine(
+            database_url,
+            poolclass=QueuePool,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_pre_ping=pool_pre_ping,
+            pool_recycle=3600,
+            echo=False,
+        )
+
+        # Backwards compatibility attribute
+        self.engine = self.write_engine
+
+        # Detect websearch_to_tsquery availability for richer search syntax
+        self.postgres_supports_websearch = False
+        with self.write_engine.connect() as conn:
+            try:
+                conn.execute(text("SELECT websearch_to_tsquery('english', 'test')"))
+                self.postgres_supports_websearch = True
+            except Exception:
+                self.postgres_supports_websearch = False
+
+        # Configure read replicas
+        self.read_engines = []
+        for replica_url in self.read_replica_urls:
+            if not replica_url or replica_url == database_url:
+                continue
+            engine = create_engine(
+                replica_url,
                 poolclass=QueuePool,
-                pool_size=pool_size,
-                max_overflow=max_overflow,
+                pool_size=max(1, pool_size // 2),
+                max_overflow=max(0, max_overflow // 2),
                 pool_pre_ping=pool_pre_ping,
                 pool_recycle=3600,
                 echo=False,
             )
-
-        # Backwards compatibility attribute
-        self.engine = self.write_engine
-        self.postgres_supports_websearch = False
-
-        # Detect websearch_to_tsquery availability for richer search syntax
-        if self.is_postgres:
-            with self.write_engine.connect() as conn:
-                try:
-                    conn.execute(text("SELECT websearch_to_tsquery('english', 'test')"))
-                    self.postgres_supports_websearch = True
-                except Exception:
-                    self.postgres_supports_websearch = False
-
-        # Configure read replicas (PostgreSQL only)
-        self.read_engines = []
-        if self.is_postgres:
-            for replica_url in self.read_replica_urls:
-                if not replica_url or replica_url == database_url:
-                    continue
-                engine = create_engine(
-                    replica_url,
-                    poolclass=QueuePool,
-                    pool_size=max(1, pool_size // 2),
-                    max_overflow=max(0, max_overflow // 2),
-                    pool_pre_ping=pool_pre_ping,
-                    pool_recycle=3600,
-                    echo=False,
-                )
-                self.read_engines.append(engine)
-        else:
-            self.read_engines = []
+            self.read_engines.append(engine)
 
         # Session factories
         self.SessionLocal = sessionmaker(bind=self.write_engine)
@@ -167,6 +143,16 @@ class DatabaseBackend:
             yield session
         finally:
             session.close()
+
+    def get_session(self):
+        """
+        Return a new read/write session bound to the primary engine.
+
+        Usable as a context manager (``with backend.get_session() as session:``);
+        callers commit explicitly. This is the primary-engine counterpart to
+        ``read_session`` and guarantees read-after-write consistency.
+        """
+        return self.SessionLocal()
 
     def upsert_vectormap(self, vm: VectorMap) -> None:
         """Store a VectorMap into the database."""
@@ -227,7 +213,7 @@ class DatabaseBackend:
                             bbox=bbox_json,
                             font=t.font,
                             size=t.size,
-                            source="native"
+                            source=t.source or "native"
                         ))
                     session.bulk_save_objects(text_objs)
 
@@ -307,6 +293,7 @@ class DatabaseBackend:
                         bbox=bbox,  # type: ignore[arg-type]
                         font=row.font,
                         size=row.size,
+                        source=row.source or "native",
                     )
                 )
 
@@ -422,7 +409,6 @@ class DatabaseBackend:
             ).order_by(TextRow.page_number, TextRow.id).all()
 
             if format == "json":
-                import json
                 data = {
                     "doc_id": doc_id,
                     "path": doc.path,
@@ -487,44 +473,24 @@ class DatabaseBackend:
             List of (doc_id, page_number, text, bbox, font, size) tuples
         """
         with self.read_session() as session:
-            if self.is_postgres:
-                tsquery_fn = "websearch_to_tsquery" if self.postgres_supports_websearch else "plainto_tsquery"
-                clauses = [
-                    "SELECT doc_id, page_number, text, bbox, font, size",
-                    "FROM text_rows",
-                    f"WHERE to_tsvector('english', text) @@ {tsquery_fn}('english', :query)"
-                ]
-                params = {"query": query, "limit": limit}
+            tsquery_fn = "websearch_to_tsquery" if self.postgres_supports_websearch else "plainto_tsquery"
+            clauses = [
+                "SELECT doc_id, page_number, text, bbox, font, size",
+                "FROM text_rows",
+                f"WHERE to_tsvector('english', text) @@ {tsquery_fn}('english', :query)"
+            ]
+            params = {"query": query, "limit": limit}
 
-                if doc_id:
-                    clauses.append("AND doc_id = :doc_id")
-                    params["doc_id"] = doc_id
-                if page:
-                    clauses.append("AND page_number = :page")
-                    params["page"] = page
+            if doc_id:
+                clauses.append("AND doc_id = :doc_id")
+                params["doc_id"] = doc_id
+            if page:
+                clauses.append("AND page_number = :page")
+                params["page"] = page
 
-                clauses.append("ORDER BY page_number LIMIT :limit")
-                sql = text(" ".join(clauses))
-                result = session.execute(sql, params)
-            else:
-                # Fallback simple LIKE search (SQLite or unsupported engines)
-                query_like = query.replace("*", "%")
-                stmt = select(
-                    TextRow.doc_id,
-                    TextRow.page_number,
-                    TextRow.text,
-                    TextRow.bbox,
-                    TextRow.font,
-                    TextRow.size
-                ).where(TextRow.text.like(f"%{query_like}%"))
-
-                if doc_id:
-                    stmt = stmt.where(TextRow.doc_id == doc_id)
-                if page:
-                    stmt = stmt.where(TextRow.page_number == page)
-
-                stmt = stmt.order_by(TextRow.page_number).limit(limit)
-                result = session.execute(stmt)
+            clauses.append("ORDER BY page_number LIMIT :limit")
+            sql = text(" ".join(clauses))
+            result = session.execute(sql, params)
 
             return result.fetchall()
 

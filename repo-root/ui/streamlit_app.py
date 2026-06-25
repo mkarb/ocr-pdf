@@ -2,16 +2,16 @@
 
 Usage
 -----
-1) Ensure the `vectormap` package from our previous step is on PYTHONPATH (or installed as an editable package).
+1) Ensure the `pdf_compare` package is on PYTHONPATH (or installed as an editable package).
    Repo layout example:
 
    pdf_compare/
      __init__.py
      models.py
      pdf_extract.py
-     store.py
-     search.py
-     compare.py
+     store_new.py
+     search_new.py
+     compare_new.py
      overlay.py
    ui/
      streamlit_app.py  (this file)
@@ -332,11 +332,14 @@ with workspace_tab:
 
                             # Choose extraction function based on OCR setting
                             if enable_ocr:
+                                selected_engine = "easyocr" if "EasyOCR" in ocr_engine else "tesseract"
                                 vectormap = pdf_to_vectormap(
                                     str(target_path),
                                     workers=worker_count,
                                     enable_ocr=True,
                                     ocr_dpi=ocr_dpi,
+                                    ocr_engine=selected_engine,
+                                    ocr_use_gpu=(selected_engine == "easyocr"),
                                 )
                             else:
                                 vectormap = pdf_to_vectormap_server(
@@ -505,9 +508,9 @@ with workspace_tab:
                         if not text_data:
                             st.warning("No text found in document. OCR may not have been run.")
                         else:
-                            # Generate output path
+                            # Generate output path (under the configured data dir)
                             output_filename = Path(source_path).stem + "_searchable.pdf"
-                            output_path = f"/app/outputs/{output_filename}"
+                            output_path = str(outputs_dir / output_filename)
 
                             # Create searchable PDF
                             create_searchable_pdf(source_path, text_data, output_path)

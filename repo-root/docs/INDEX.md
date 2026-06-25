@@ -49,7 +49,6 @@ Architecture and implementation details:
 
 - [Quick Reference](reference/QUICK_REFERENCE.md) - Commands, troubleshooting, model selection
 - [Implementation Summary](reference/IMPLEMENTATION_SUMMARY.md) - Complete feature list and technical details
-- [Database Comparison](reference/DATABASE_COMPARISON.md) - SQLite vs PostgreSQL
 - [Server Mode Comparison](reference/SERVER_MODE_COMPARISON.md) - Processing modes comparison
 - [Server Mode README](reference/SERVER_MODE_README.md) - Server-side processing details
 
@@ -84,8 +83,7 @@ Architecture and implementation details:
 ### I want to deploy to production
 
 1. [Docker Deployment Guide](deployment/DOCKER_DEPLOYMENT.md) → Production Deployment section
-2. [Database Comparison](reference/DATABASE_COMPARISON.md) - Choose database backend
-3. [Server Mode Comparison](reference/SERVER_MODE_COMPARISON.md) - Choose processing mode
+2. [Server Mode Comparison](reference/SERVER_MODE_COMPARISON.md) - Choose processing mode
 
 ### I'm troubleshooting an issue
 
@@ -117,7 +115,6 @@ docs/
 └── reference/                  # Technical reference
     ├── QUICK_REFERENCE.md
     ├── IMPLEMENTATION_SUMMARY.md
-    ├── DATABASE_COMPARISON.md
     ├── SERVER_MODE_COMPARISON.md
     └── SERVER_MODE_README.md
 ```
@@ -146,7 +143,6 @@ docs/
 **DevOps/SysAdmin:**
 - [Docker Deployment Guide](deployment/DOCKER_DEPLOYMENT.md) - Container deployment
 - [Docker Build Verification](deployment/DOCKER_BUILD_VERIFICATION.md) - Testing
-- [Database Comparison](reference/DATABASE_COMPARISON.md) - Database selection
 
 **End User:**
 - [Streamlit Features](guides/STREAMLIT_FEATURES.md) - Using the UI

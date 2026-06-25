@@ -12,9 +12,9 @@ def test_ollama_connection():
     """Test if Ollama is running and accessible."""
     print("Testing Ollama connection...")
     try:
-        from langchain_community.llms import Ollama
+        from langchain_ollama import OllamaLLM
 
-        llm = Ollama(model="llama3.2")
+        llm = OllamaLLM(model="llama3.2")
         response = llm.invoke("Say 'OK' if you can hear me.")
 
         if "ok" in response.lower():
@@ -36,7 +36,7 @@ def test_embeddings():
     """Test if embedding model is available."""
     print("\nTesting embedding model...")
     try:
-        from langchain_community.embeddings import OllamaEmbeddings
+        from langchain_ollama import OllamaEmbeddings
 
         embeddings = OllamaEmbeddings(model="nomic-embed-text")
         test_text = ["This is a test"]
