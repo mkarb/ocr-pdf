@@ -12,7 +12,9 @@ Section status: all 10 sections reviewed; fixes applied per section (see each se
 ## Second Pass — correctness on large diagrams
 
 **Resolved this pass:** S1 (new shared `highres_ocr.ocr_page()` auto-tiles oversized pages; both `pdf_extract._extract_text` and CLI `_run_ocr_augment` now route through it, so `ocr-augment`/`compare --with-ocr` work on large sheets and the duplicate OCR-a-page logic is gone — tests in `tests/test_ocr_page.py`), S2 (bounded `submit_throttled` stall detection — aborts with context after 3×300 s of no progress instead of looping forever).
-**Still open:** S3 (raster-compare whole-page render/ECC on large sheets), S4 (surface swallowed OCR errors), S5 (configurable OCR threshold).
+**Still open:** S4 (surface swallowed OCR errors), S5 (configurable OCR threshold).
+
+**Resolved (third pass):** S3 — `raster_grid` now caps the render resolution (`max_render_pixels=8000`, one effective DPI for both pages) so large sheets are change-detected at a tractable size instead of rendering/ECC-aligning a ~17000×11000 image. Output boxes are PDF-space so coordinates are unchanged; `render_dpi` surfaced in metrics. Tests in `tests/test_raster_render_cap.py`.
 
 ### S1 🔴 `ocr-augment` / `compare --with-ocr` don't tile large pages → OOM / Tesseract limit
 The ingest OCR path (`pdf_extract._extract_text`) checks `needs_tiling` and calls `tiled_ocr` for big pages. But `_run_ocr_augment` (CLI `ocr-augment` **and** `compare --with-ocr`) calls `highres_ocr(...)`, which renders the **whole page** at `cfg.dpi` (`_render_page_gray`) with no size check. On a large E-size sheet at 500 DPI that pixmap is ~150–500 MB and exceeds Tesseract's ~32,767-px hard limit → the augment path fails or OOMs on exactly the diagrams that are the project's purpose. (You said tiling is the key — and one of the two OCR entry points skips it.)
