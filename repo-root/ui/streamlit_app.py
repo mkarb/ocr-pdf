@@ -340,6 +340,7 @@ with workspace_tab:
                                     ocr_dpi=ocr_dpi,
                                     ocr_engine=selected_engine,
                                     ocr_use_gpu=(selected_engine == "easyocr"),
+                                    progress_callback=update_progress,
                                 )
                             else:
                                 vectormap = pdf_to_vectormap_server(
@@ -380,6 +381,21 @@ with workspace_tab:
                             f"Ingested {uploaded_file.name} as {vectormap.meta.doc_id} "
                             f"({vectormap.meta.page_count} pages in {elapsed:.1f}s)"
                         )
+
+                    # Surface OCR effectiveness so a silent OCR failure/no-op is visible.
+                    if enable_ocr:
+                        ocr_spans = sum(
+                            1 for pg in vectormap.pages for t in pg.texts
+                            if getattr(t, "source", None) == "ocr"
+                        )
+                        with status_container:
+                            if ocr_spans:
+                                st.info(f"OCR added {ocr_spans} text span(s) for {uploaded_file.name}")
+                            else:
+                                st.warning(
+                                    f"OCR produced no text for {uploaded_file.name} — the page may already "
+                                    "have ample native text, or OCR failed (check the server logs)."
+                                )
 
                 except Exception as exc:
                     with status_container:
