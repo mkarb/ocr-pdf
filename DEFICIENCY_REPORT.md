@@ -12,7 +12,8 @@ Section status: all 10 sections reviewed; fixes applied per section (see each se
 ## Second Pass — correctness on large diagrams
 
 **Resolved this pass:** S1 (new shared `highres_ocr.ocr_page()` auto-tiles oversized pages; both `pdf_extract._extract_text` and CLI `_run_ocr_augment` now route through it, so `ocr-augment`/`compare --with-ocr` work on large sheets and the duplicate OCR-a-page logic is gone — tests in `tests/test_ocr_page.py`), S2 (bounded `submit_throttled` stall detection — aborts with context after 3×300 s of no progress instead of looping forever).
-**Still open:** S4 (surface swallowed OCR errors), S5 (configurable OCR threshold).
+**Still open:** S5 (configurable OCR threshold).
+**Resolved (run-experience pass):** S4 — OCR errors in `_extract_text` are no longer swallowed to stderr; they log at ERROR with traceback via a module logger, the debug prints became `logger.debug`, and the UI surfaces OCR effectiveness after ingest (`OCR added N spans` / a warning when OCR produced nothing). Pairs with 7.4 below.
 
 ### S6 🔴 `table_extractor` renders the whole page at full DPI (BOM path) — last tiling gap — RESOLVED
 `detect_table_regions` and `extract_table` used to `get_pixmap` the **entire page** at `config.dpi` (400) — a ~17000×11000 pixmap on an E-size sheet — and `extract_table` rendered the full page *then* cropped, so memory peaked on the whole sheet even for a small table.
@@ -147,7 +148,8 @@ Default flipped `enable_ocr=True` → `False`: table extraction uses vector geom
 ## Section 7 — UI (`ui/streamlit_app.py`, `ui/streamlit_session_manager.py`)
 
 **Resolved this pass:** 7.1 (threaded `ocr_engine`/`ocr_use_gpu` through `pdf_to_vectormap` → `_extract_page_job` → `_extract_text` → `resolve_ocr_engine`; the UI dropdown now actually selects EasyOCR/GPU vs Tesseract), 7.2 (searchable-PDF output now uses `outputs_dir`, not `/app/outputs`), 7.3 (Streamlit floor bumped to `>=1.49` in both manifests), 7.6 (fixed stale layout docstring), 7.7 (removed unused `session_cached` + `get_session_info` + `wraps` import).
-**Still open:** 7.4 (no OCR progress + serial under Streamlit), 7.5 (DPI-to-2000 guard), 7.8 (bare import / heavy RAG object in session). `GlobalSessionStore` kept (still called by `init_session` cleanup) though its store is never populated.
+**Still open:** 7.5 (DPI-to-2000 guard), 7.8 (bare import / heavy RAG object in session). `GlobalSessionStore` kept (still called by `init_session` cleanup) though its store is never populated.
+**Resolved (run-experience pass):** 7.4 — `pdf_to_vectormap` now accepts a `progress_callback`; the UI passes `update_progress` on the OCR ingest path too, so the page-progress bar advances during large-diagram OCR instead of looking frozen. (OCR still runs serial under Streamlit by design, but now with live feedback.)
 
 ---
 
