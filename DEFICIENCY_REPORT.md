@@ -14,9 +14,9 @@ Section status: all 10 sections reviewed; fixes applied per section (see each se
 **Resolved this pass:** S1 (new shared `highres_ocr.ocr_page()` auto-tiles oversized pages; both `pdf_extract._extract_text` and CLI `_run_ocr_augment` now route through it, so `ocr-augment`/`compare --with-ocr` work on large sheets and the duplicate OCR-a-page logic is gone — tests in `tests/test_ocr_page.py`), S2 (bounded `submit_throttled` stall detection — aborts with context after 3×300 s of no progress instead of looping forever).
 **Still open:** S4 (surface swallowed OCR errors), S5 (configurable OCR threshold).
 
-### S6 🔴 `table_extractor` renders the whole page at full DPI (BOM path) — last tiling gap
-`detect_table_regions` (line 976) and `extract_table` (line 1073) `get_pixmap` the **entire page** at `config.dpi` (400). On an E-size sheet that's a ~17000×11000 pixmap; and `extract_table` renders the full page *then* crops to `table_bbox` (line 1078), so the memory peak is the whole sheet even when only a small table is wanted. This is the BOM/parts-list path — the scale wall hits exactly the feature flagged as important.
-- **Fix:** cap the detection render (like S3) in `detect_table_regions`; in `extract_table`, render only the `table_bbox` via `get_pixmap(clip=...)` at full DPI (bounded to the table) and cap the no-bbox whole-page render.
+### S6 🔴 `table_extractor` renders the whole page at full DPI (BOM path) — last tiling gap — RESOLVED
+`detect_table_regions` and `extract_table` used to `get_pixmap` the **entire page** at `config.dpi` (400) — a ~17000×11000 pixmap on an E-size sheet — and `extract_table` rendered the full page *then* cropped, so memory peaked on the whole sheet even for a small table.
+- **Fixed:** added `_capped_dpi` + `TableExtractionConfig.max_render_pixels` (8000). `detect_table_regions` now renders at a capped DPI (region-level detection doesn't need full res). `extract_table` renders **only the table region** via `get_pixmap(clip=...)` at full DPI when a bbox is known (cell OCR stays sharp, memory bounded to the table), and caps the no-bbox whole-page render. Coordinate mapping unchanged (offset = region top-left in full-page pixels). Tests in `tests/test_table_render_cap.py`. This was the last whole-page-render tiling gap (only the `overlay.py` raster fallback, S7, remains — low severity).
 
 ### S7 🟢 Overlay raster fallback renders whole page (`overlay.py:97`)
 Fixed `Matrix(3,3)` (~216 DPI) whole-page render, but only on the fallback path (layered PDFs where direct annotation fails). Low severity.
