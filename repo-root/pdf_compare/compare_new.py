@@ -3,6 +3,9 @@ Document comparison with SQLAlchemy backend support.
 """
 
 from __future__ import annotations
+from collections import defaultdict, deque
+from math import hypot
+from numbers import Integral
 from typing import List, Dict
 import numpy as np
 from shapely.wkb import loads as wkb_loads
@@ -15,7 +18,6 @@ from .db_backend import DatabaseBackend
 # Tolerances
 GEO_TOL: float = 0.15
 TEXT_MOVE_TOL: float = 0.75
-AREA_EPS: float = 1e-2
 
 
 # Geometry matching helpers (reused from original)
@@ -48,21 +50,24 @@ def _query_hits(tree: STRtree | None, gb: BaseGeometry, backing: List[BaseGeomet
     return hits
 
 
-def _geom_matches(gb: BaseGeometry, candidates: List[BaseGeometry]) -> bool:
-    """Return True if buffered geom matches any candidate within tolerance."""
-    if gb is None or gb.is_empty:
+def _geom_matches(
+    geom: BaseGeometry,
+    candidates: List[BaseGeometry],
+    buffered: BaseGeometry,
+) -> bool:
+    """Require every part of both geometries to lie within GEO_TOL.
+
+    Comparing buffered areas, or accepting containment in either direction,
+    hides shortened strokes and resized fills. Each original geometry must
+    instead be covered by the other's tolerance buffer.
+    """
+    if geom is None or geom.is_empty:
         return False
     for h in candidates:
         if h is None or h.is_empty:
             continue
         try:
-            if not gb.envelope.intersects(h.envelope):
-                continue
-            if gb.intersects(h):
-                sym = gb.symmetric_difference(h)
-                if sym.is_empty or sym.area < AREA_EPS:
-                    return True
-            if gb.difference(h).area < AREA_EPS or h.difference(gb).area < AREA_EPS:
+            if buffered.covers(h) and h.buffer(GEO_TOL).covers(geom):
                 return True
         except GEOSException:
             continue
@@ -78,13 +83,14 @@ def diff_documents(
     """
     Compare two ingested documents page by page (vector + text).
     Returns a list of per-page diff dicts compatible with overlay.py.
+    Includes trailing pages present in only one document, including blank pages.
     """
     if not isinstance(backend, DatabaseBackend):
         raise TypeError("diff_documents requires a DatabaseBackend (SQLite support removed)")
 
     # Get page counts from backend
     with backend.SessionLocal() as session:
-        from .db_models import Document
+        from .db_models import Document, Page
         old_doc = session.get(Document, old_id)
         new_doc = session.get(Document, new_id)
 
@@ -93,10 +99,32 @@ def diff_documents(
 
         pc_old, pc_new = old_doc.page_count, new_doc.page_count
 
-    max_pages = min(pc_old, pc_new)
-    if pages is None:
-        pages = list(range(1, max_pages + 1))
-    return [diff_pages(backend, old_id, new_id, p) for p in pages]
+        max_pages = max(pc_old, pc_new)
+        if pages is None:
+            pages = list(range(1, max_pages + 1))
+        else:
+            pages = list(pages)
+        for page in pages:
+            if isinstance(page, bool) or not isinstance(page, Integral) or not 1 <= page <= max_pages:
+                raise ValueError(f"Invalid page {page!r}; expected an integer between 1 and {max_pages}")
+
+        page_metadata = {}
+        for page in pages:
+            if page <= min(pc_old, pc_new):
+                continue
+            added = page > pc_old
+            metadata = {"page_status": "added" if added else "removed"}
+            stored_page = session.get(Page, (new_id if added else old_id, page))
+            if stored_page is not None and stored_page.width and stored_page.height:
+                metadata["page_size"] = (stored_page.width, stored_page.height)
+            page_metadata[page] = metadata
+
+    diffs = []
+    for page in pages:
+        diff = _diff_page_contents(backend, old_id, new_id, page)
+        diff.update(page_metadata.get(page, {}))
+        diffs.append(diff)
+    return diffs
 
 
 def diff_pages(
@@ -105,15 +133,61 @@ def diff_pages(
     new_id: str,
     page: int
 ) -> Dict:
-    """Compare a single page between two documents."""
-    if not isinstance(backend, DatabaseBackend):
-        raise TypeError("diff_pages requires a DatabaseBackend (SQLite support removed)")
+    """Compare one validated page, including a page present in only one PDF."""
+    return diff_documents(backend, old_id, new_id, pages=[page])[0]
+
+
+def _text_bbox_distance(a, b):
+    """Measure movement of both corners so centered resizing is detected too."""
+    return max(hypot(a[0] - b[0], a[1] - b[1]), hypot(a[2] - b[2], a[3] - b[3]))
+
+
+def _match_texts(a_txt, b_txt):
+    """Match identical text, reserving unchanged occurrences before moved ones."""
+    exact_b = defaultdict(deque)
+    for j, (text, bbox) in enumerate(b_txt):
+        exact_b[(text, tuple(bbox))].append(j)
+
+    matches = {}
+    used_b = set()
+    for i, (text, bbox) in enumerate(a_txt):
+        exact = exact_b.get((text, tuple(bbox)))
+        if exact:
+            j = exact.popleft()
+            matches[i] = j
+            used_b.add(j)
+
+    remaining_a = defaultdict(list)
+    remaining_b = defaultdict(list)
+    for i, (text, bbox) in enumerate(a_txt):
+        if i not in matches:
+            remaining_a[text].append(i)
+    for j, (text, bbox) in enumerate(b_txt):
+        if j not in used_b:
+            remaining_b[text].append(j)
+
+    # Match the closest remaining pair first, independent of database row order.
+    # Exact matches above avoid quadratic work for unchanged repeated labels.
+    for text, old_indices in remaining_a.items():
+        candidates = sorted(
+            (_text_bbox_distance(a_txt[i][1], b_txt[j][1]), i, j)
+            for i in old_indices for j in remaining_b.get(text, [])
+        )
+        for _, i, j in candidates:
+            if i not in matches and j not in used_b:
+                matches[i] = j
+                used_b.add(j)
+    return matches, used_b
+
+
+def _diff_page_contents(backend, old_id, new_id, page):
+    """Compare stored content after document and page selection validation."""
 
     # Load geometries
     a_geom_wkbs = backend.load_page_geoms(old_id, page)
     b_geom_wkbs = backend.load_page_geoms(new_id, page)
-    a_geoms = [wkb_loads(wkb) for wkb in a_geom_wkbs]
-    b_geoms = [wkb_loads(wkb) for wkb in b_geom_wkbs]
+    a_geoms = [g for wkb in a_geom_wkbs if not (g := wkb_loads(wkb)).is_empty]
+    b_geoms = [g for wkb in b_geom_wkbs if not (g := wkb_loads(wkb)).is_empty]
 
     # Load text
     a_txt = backend.load_page_texts(old_id, page)
@@ -131,51 +205,35 @@ def diff_pages(
     a_buf = [g.buffer(GEO_TOL) for g in a_geoms] if a_geoms else []
     b_buf = [g.buffer(GEO_TOL) for g in b_geoms] if b_geoms else []
 
-    tree_a = STRtree(a_buf) if a_buf else None
-    tree_b = STRtree(b_buf) if b_buf else None
+    tree_a = STRtree(a_geoms) if a_geoms else None
+    tree_b = STRtree(b_geoms) if b_geoms else None
 
     removed_geo, added_geo = [], []
 
     # removed: A not in B
     for g, gb in zip(a_geoms, a_buf):
-        hits = _query_hits(tree_b, gb, b_buf)
-        if not hits or not _geom_matches(gb, hits):
+        hits = _query_hits(tree_b, gb, b_geoms)
+        if not hits or not _geom_matches(g, hits, gb):
             removed_geo.append(g)
 
     # added: B not in A
     for g, gb in zip(b_geoms, b_buf):
-        hits = _query_hits(tree_a, gb, a_buf)
-        if not hits or not _geom_matches(gb, hits):
+        hits = _query_hits(tree_a, gb, a_geoms)
+        if not hits or not _geom_matches(g, hits, gb):
             added_geo.append(g)
 
     # Text diff
-    used_b: set[int] = set()
+    matches, used_b = _match_texts(a_txt, b_txt)
     removed_text: List[Dict] = []
     added_text: List[Dict] = []
     moved_text: List[Dict] = []
 
-    def _center(bb):
-        x0, y0, x1, y1 = bb
-        return (0.5 * (x0 + x1), 0.5 * (y0 + y1))
-
     for i, (t, bb) in enumerate(a_txt):
-        ac = _center(bb)
-        match_j = None
-        best_dist = None
-        for j, (t2, bb2) in enumerate(b_txt):
-            if j in used_b or t2 != t:
-                continue
-            bc = _center(bb2)
-            dx, dy = ac[0] - bc[0], ac[1] - bc[1]
-            dist = (dx * dx + dy * dy) ** 0.5
-            if best_dist is None or dist < best_dist:
-                best_dist, match_j = dist, j
-
+        match_j = matches.get(i)
         if match_j is None:
             removed_text.append({"text": t, "bbox": bb})
         else:
-            used_b.add(match_j)
-            if best_dist is not None and best_dist > TEXT_MOVE_TOL:
+            if _text_bbox_distance(bb, b_txt[match_j][1]) > TEXT_MOVE_TOL:
                 moved_text.append({"text": t, "from": bb, "to": b_txt[match_j][1]})
 
     for j, (t2, bb2) in enumerate(b_txt):

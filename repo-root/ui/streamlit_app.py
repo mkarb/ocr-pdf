@@ -37,7 +37,7 @@ Notes
 - Database location is configured via `DATABASE_URL` (PostgreSQL).
 - Overlays are generated locally; no external calls.
 - Large PDFs: ingestion time scales with page count; progress bars included.
-- Geometry registration (alignment) is not enabled here; add a module later if needed.
+- Visual comparison aligns scan shifts; vector and text comparison uses extracted coordinates.
 """
 
 from __future__ import annotations
@@ -81,8 +81,9 @@ try:
     from pdf_compare.overlay import create_searchable_pdf
     from pdf_compare.search_new import search_text as vm_search_text
     from pdf_compare.compare_new import diff_documents
+    from pdf_compare.comparison import diff_pdf_files
+    from pdf_compare.layout_compare import diff_layout_files
     from pdf_compare.overlay import write_overlay
-    from pdf_compare.rag_simple import SimplePDFChat
     from pdf_compare.table_workflows import (
         PageSelectionError,
         parse_page_selection,
@@ -108,6 +109,8 @@ SessionManager.initialize_defaults({
     "extracted_tables": [],
     "last_diffs": [],
     "last_pair": None,
+    "last_comparison_settings": None,
+    "last_overlay": None,
 })
 
 # Sidebar configuration
@@ -194,6 +197,8 @@ def display_pdf(pdf_path: Path, *, height: int = 720) -> None:
 
 
 def get_rag_chat(doc_id: str, doc_path: Path, *, force_refresh: bool = False) -> "SimplePDFChat":
+    from pdf_compare.rag_simple import SimplePDFChat
+
     cache = SessionManager.get_user_state("rag_chat_cache")
     if not isinstance(cache, dict):
         cache = {}
@@ -855,25 +860,67 @@ if len(docs) >= 2:
             index=1 if len(docs) > 1 else 0,
         )
 
-    if st.button("Compare documents", type="secondary"):
-        old_id = old_choice.split(" - ", maxsplit=1)[0]
-        new_id = new_choice.split(" - ", maxsplit=1)[0]
-        try:
-            diffs = diff_documents(backend, old_id, new_id)
-            st.success(f"Computed diffs for {len(diffs)} page(s)")
-            st.dataframe(
-                {
-                    "page": [d["page"] for d in diffs],
-                    "added geom": [len(d["geometry"]["added"]) for d in diffs],
-                    "removed geom": [len(d["geometry"]["removed"]) for d in diffs],
-                    "added text": [len(d["text"]["added"]) for d in diffs],
-                    "removed text": [len(d["text"]["removed"]) for d in diffs],
-                    "moved text": [len(d["text"]["moved"]) for d in diffs],
-                },
-                width="stretch",
+    comparison_method = st.selectbox(
+        "Comparison method",
+        ["Visual (raster)", "Vector and text", "Layout"],
+        help="Visual comparison detects changes in scans, images, and drawings. "
+             "Vector and text compares extracted shapes and text. "
+             "Layout compares the positions and sizes of content blocks.",
+    )
+    grid_ratio = 0.0
+    if comparison_method == "Visual (raster)":
+        grid_ratio = st.number_input(
+            "Minimum changed area per grid cell (%)", min_value=0.0,
+            max_value=100.0, value=0.0, step=0.1,
+            help="Zero detects small details, including single characters on large sheets. "
+                 "Increase this value to filter scan noise; small revisions may also be filtered.",
+        ) / 100.0
+    position_tolerance = size_tolerance = 3.0
+    if comparison_method == "Layout":
+        st.caption("Detects moved, resized, added, and removed blocks. Wording changes alone are ignored. "
+                   "Scanned pages use visual regions; OCR is not required.")
+        position_column, size_column = st.columns(2)
+        with position_column:
+            position_tolerance = st.number_input(
+                "Position tolerance (points)", min_value=0.0, value=3.0, step=0.5,
+                help="Ignore block movements within this distance. 72 points equals one inch.",
             )
+        with size_column:
+            size_tolerance = st.number_input(
+                "Size tolerance (points)", min_value=0.0, value=3.0, step=0.5,
+                help="Ignore width or height changes within this tolerance.",
+            )
+    comparison_settings = (comparison_method, grid_ratio, position_tolerance, size_tolerance)
+    st.caption("Pages are compared by page number, including added or removed trailing pages.")
+    old_id = old_choice.split(" - ", maxsplit=1)[0]
+    new_id = new_choice.split(" - ", maxsplit=1)[0]
+    selected_pair = (old_id, new_id)
+    doc_map = {doc_id: (path, pages) for doc_id, path, pages in docs}
+
+    if (SessionManager.get_user_state("last_pair") != selected_pair
+            or SessionManager.get_user_state("last_comparison_settings") != comparison_settings):
+        SessionManager.set_user_state("last_diffs", [])
+        SessionManager.set_user_state("last_overlay", None)
+
+    if st.button("Compare documents", type="secondary"):
+        SessionManager.set_user_state("last_diffs", [])
+        SessionManager.set_user_state("last_overlay", None)
+        try:
+            with st.spinner("Comparing documents..."):
+                if comparison_method == "Visual (raster)":
+                    diffs = diff_pdf_files(
+                        doc_map[old_id][0], doc_map[new_id][0], cell_change_ratio=grid_ratio,
+                    )
+                elif comparison_method == "Layout":
+                    diffs = diff_layout_files(
+                        doc_map[old_id][0], doc_map[new_id][0],
+                        position_tolerance=position_tolerance, size_tolerance=size_tolerance,
+                    )
+                else:
+                    diffs = diff_documents(backend, old_id, new_id)
             SessionManager.set_user_state("last_diffs", diffs)
-            SessionManager.set_user_state("last_pair", (old_id, new_id))
+            SessionManager.set_user_state("last_pair", selected_pair)
+            SessionManager.set_user_state("last_comparison_settings", comparison_settings)
         except Exception as exc:
             st.error(f"Compare failed: {exc}")
 
@@ -882,27 +929,74 @@ if len(docs) >= 2:
 
     if last_diffs and last_pair:
         old_id, new_id = last_pair
-        doc_map = {doc_id: (path, pages) for doc_id, path, pages in docs}
+        st.success(f"Computed diffs for {len(last_diffs)} page(s)")
+        if comparison_method == "Layout":
+            summary = {
+                "page": [d["page"] for d in last_diffs],
+                "page status": [d.get("page_status", "compared") for d in last_diffs],
+                "page layout changed": [d.get("layout_page_changed", False) for d in last_diffs],
+                "added blocks": [len(d["layout"]["added"]) for d in last_diffs],
+                "removed blocks": [len(d["layout"]["removed"]) for d in last_diffs],
+                "moved blocks": [len(d["layout"]["moved"]) for d in last_diffs],
+                "resized blocks": [len(d["layout"]["resized"]) for d in last_diffs],
+            }
+        else:
+            summary = {
+                "page": [d["page"] for d in last_diffs],
+                "page status": [d.get("page_status", "compared") for d in last_diffs],
+                "changed regions": [len(d["geometry"].get("changed", [])) for d in last_diffs],
+                "added geom": [len(d["geometry"]["added"]) for d in last_diffs],
+                "removed geom": [len(d["geometry"]["removed"]) for d in last_diffs],
+                "added text": [len(d["text"]["added"]) for d in last_diffs],
+                "removed text": [len(d["text"]["removed"]) for d in last_diffs],
+                "moved text": [len(d["text"]["moved"]) for d in last_diffs],
+            }
+        st.dataframe(summary, width="stretch")
+        if comparison_method == "Layout":
+            def format_layout_bounds(bounds):
+                return ", ".join(f"{value:.1f}" for value in bounds) if bounds else ""
+
+            rows = []
+            for diff in last_diffs:
+                for change in ("added", "removed", "moved", "resized"):
+                    for block in diff["layout"][change]:
+                        rows.append({
+                            "page": diff["page"], "change": change,
+                            "block type": block["kind"],
+                            "old bounds (points)": format_layout_bounds(
+                                block.get("from", block.get("bbox") if change == "removed" else None)),
+                            "new bounds (points)": format_layout_bounds(
+                                block.get("to", block.get("bbox") if change == "added" else None)),
+                        })
+            if rows:
+                with st.expander("Layout change details"):
+                    st.dataframe(rows, width="stretch")
         base_pdf_path = doc_map.get(new_id, (None,))[0]
-        overlay_name = f"diff_overlay_{old_id[:6]}_{new_id[:6]}.pdf"
+        overlay_prefix = "layout_overlay" if comparison_method == "Layout" else "diff_overlay"
+        overlay_name = f"{overlay_prefix}_{old_id[:6]}_{new_id[:6]}.pdf"
         overlay_path = outputs_dir / overlay_name
 
         if st.button("Create overlay PDF", type="primary"):
             try:
                 if base_pdf_path is None:
                     raise RuntimeError("Unable to resolve revised document path")
-                write_overlay(base_pdf_path, last_diffs, str(overlay_path))
+                write_overlay(
+                    base_pdf_path, last_diffs, str(overlay_path),
+                    alternate_pdf_path=doc_map[old_id][0],
+                )
+                SessionManager.set_user_state("last_overlay", (overlay_name, overlay_path.read_bytes()))
                 st.success(f"Overlay written to {overlay_path}")
-                with open(overlay_path, "rb") as handle:
-                    st.download_button(
-                        "Download overlay PDF",
-                        data=handle,
-                        file_name=overlay_name,
-                        mime="application/pdf",
-                    )
             except Exception as exc:
                 st.error(f"Overlay generation failed: {exc}")
+        last_overlay = SessionManager.get_user_state("last_overlay")
+        if last_overlay:
+            st.download_button(
+                "Download overlay PDF", data=last_overlay[1],
+                file_name=last_overlay[0], mime="application/pdf",
+            )
 else:
+    SessionManager.set_user_state("last_diffs", [])
+    SessionManager.set_user_state("last_overlay", None)
     st.info("Ingest at least two documents to enable comparison.")
 
 with viewer_tab:

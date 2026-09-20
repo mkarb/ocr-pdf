@@ -8,9 +8,9 @@ from .store_new import upsert_vectormap, list_documents
 from .search_new import search_text as search_text_fts
 from .compare_new import diff_documents
 from .overlay import write_overlay
-from .raster_grid import raster_grid_changed_boxes
+from .comparison import diff_pdf_files, resolve_overlay_sources
+from .layout_compare import diff_layout_files
 from .analyzers.highres_ocr import ocr_page, resolve_ocr_engine
-import fitz
 
 app = typer.Typer(add_completion=False)
 
@@ -179,45 +179,58 @@ def compare_grid(
     new_pdf: str,
     out_overlay: str = "grid_diff.pdf",
     base_pdf: str | None = None,
-    grid_dpi: int = 400,
-    grid_rows: int = 12,
-    grid_cols: int = 16,
-    grid_ratio: float = 0.03,
+    grid_dpi: int = typer.Option(400, min=1),
+    grid_rows: int = typer.Option(12, min=1),
+    grid_cols: int = typer.Option(16, min=1),
+    grid_ratio: float = typer.Option(0.0, min=0.0, max=1.0, help="Minimum changed fraction per cell; increase to filter scan noise"),
 ):
     """
     Raster grid compare (changed regions only). Does not use the DB.
     """
-    doc_old = doc_new = None
     try:
-        doc_old = fitz.open(old_pdf)
-        doc_new = fitz.open(new_pdf)
-        page_count = min(doc_old.page_count, doc_new.page_count)
-    finally:
-        try:
-            if doc_old: doc_old.close()
-        except Exception:
-            pass
-        try:
-            if doc_new: doc_new.close()
-        except Exception:
-            pass
-
-    diffs = []
-    for p in range(page_count):
-        boxes = raster_grid_changed_boxes(
-            old_pdf, new_pdf, p,
+        base, alternate = resolve_overlay_sources(old_pdf, new_pdf, base_pdf)
+        diffs = diff_pdf_files(
+            old_pdf, new_pdf, base_pdf=base,
             dpi=grid_dpi, rows=grid_rows, cols=grid_cols,
-            method="hybrid", cell_change_ratio=grid_ratio, merge_adjacent=True
+            cell_change_ratio=grid_ratio,
         )
-        diffs.append({
-            "page": p + 1,
-            "geometry": {"added": [], "removed": [], "changed": boxes},
-            "text": {"added": [], "removed": [], "moved": []},
-        })
+        write_overlay(base, diffs, out_overlay, alternate_pdf_path=alternate)
+    except (ValueError, OSError, RuntimeError) as exc:
+        typer.echo(f"Comparison failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Compared {len(diffs)} pages. Overlay written: {out_overlay}")
 
-    base = base_pdf or new_pdf
-    write_overlay(base, diffs, out_overlay)
-    print(f"Overlay written: {out_overlay}")
+
+@app.command()
+def compare_layout(
+    old_pdf: str,
+    new_pdf: str,
+    out_overlay: str = "layout_diff.pdf",
+    base_pdf: str | None = None,
+    position_tolerance: float = typer.Option(3.0, min=0.0, help="Ignore block movement up to this many PDF points"),
+    size_tolerance: float = typer.Option(3.0, min=0.0, help="Ignore block width/height changes up to this many PDF points"),
+):
+    """Compare layout: block positions, sizes, and added/removed regions. No DB required."""
+    try:
+        base, alternate = resolve_overlay_sources(old_pdf, new_pdf, base_pdf)
+        diffs = diff_layout_files(
+            old_pdf, new_pdf, position_tolerance=position_tolerance,
+            size_tolerance=size_tolerance,
+        )
+        write_overlay(base, diffs, out_overlay, alternate_pdf_path=alternate)
+    except (ValueError, OSError, RuntimeError) as exc:
+        typer.echo(f"Layout comparison failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    for diff in diffs:
+        layout = diff["layout"]
+        typer.echo(
+            f"Page {diff['page']}: {len(layout['added'])} added, "
+            f"{len(layout['removed'])} removed, {len(layout['moved'])} moved, "
+            f"{len(layout['resized'])} resized"
+            + (f"; page {diff['page_status']}" if diff.get("page_status") else "")
+            + ("; page layout changed" if diff.get("layout_page_changed") else "")
+        )
+    typer.echo(f"Compared {len(diffs)} pages. Overlay written: {out_overlay}")
 
 
 @app.command()
@@ -263,11 +276,25 @@ def compare(
             raise typer.Exit(code=1)
 
     # Proceed with vector/text diff (DB-backed)
-    diffs = diff_documents(backend, old_id, new_id)
+    try:
+        diffs = diff_documents(backend, old_id, new_id)
+    except ValueError as exc:
+        typer.echo(f"Comparison failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(f"✅ Compared {len(diffs)} pages.")
-    if out_overlay and base_pdf:
-        write_overlay(base_pdf, diffs, out_overlay)
-        print(f"Wrote overlay to {out_overlay}")
+    if out_overlay:
+        from .db_models import Document
+
+        with backend.get_session() as session:
+            old_path = session.get(Document, old_id).path
+            new_path = session.get(Document, new_id).path
+        try:
+            base, alternate = resolve_overlay_sources(old_path, new_path, base_pdf)
+            write_overlay(base, diffs, out_overlay, alternate_pdf_path=alternate)
+        except (ValueError, OSError, RuntimeError) as exc:
+            typer.echo(f"Overlay generation failed: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        typer.echo(f"Wrote overlay to {out_overlay}")
 
 
 @app.command()
