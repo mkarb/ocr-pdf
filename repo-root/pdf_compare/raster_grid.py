@@ -25,10 +25,14 @@ def _render_gray(pdf_path: str, page_index: int, dpi: float) -> tuple[np.ndarray
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    # `samples_mv` is a zero-copy memoryview; `samples` would copy the whole
+    # buffer. The view borrows `pix`, so `img` must own its data before return.
+    img = np.frombuffer(pix.samples_mv, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
     doc.close()
     if pix.n == 3:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    else:
+        img = np.array(img)
     return img, zoom
 
 

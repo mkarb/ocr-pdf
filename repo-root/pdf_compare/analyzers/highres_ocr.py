@@ -150,13 +150,15 @@ def _render_page_gray(pdf_path: str, page_index: int, dpi: int) -> tuple[np.ndar
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)  # RGB if pix.n==3
-    # Convert to numpy
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    # Convert to numpy. `samples_mv` is a zero-copy memoryview; `samples` would
+    # copy the whole buffer (a second 0.5GB+ on a large sheet). The view borrows
+    # `pix`, so `gray` must own its data before we return it.
+    img = np.frombuffer(pix.samples_mv, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
     doc.close()
     if pix.n == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     else:
-        gray = img
+        gray = np.array(img)
     return gray, zoom
 
 def _get_easyocr_reader(lang: str = "en", use_gpu: bool = True):
@@ -486,15 +488,15 @@ def render_tile(
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, clip=clip_rect, alpha=False)
 
-    # Convert to numpy
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    # Convert to numpy (zero-copy view; see _render_page_gray)
+    img = np.frombuffer(pix.samples_mv, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
     doc.close()
 
     # Convert to grayscale if needed
     if pix.n == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     else:
-        gray = img
+        gray = np.array(img)
 
     return gray
 
@@ -502,18 +504,25 @@ def render_tile(
 def detect_tile_content(
     tile_image: np.ndarray,
     white_threshold: int = 250,
-    min_content_pct: float = 0.01
+    min_content_pixels: int = 100
 ) -> bool:
     """
     Detect if tile has sufficient content to warrant OCR.
 
+    Uses an absolute inked-pixel floor, NOT a fraction of tile area. Ink coverage
+    on an engineering sheet is roughly scale-invariant (~0.3-1% of area at any
+    DPI), so an area ratio cannot separate "blank" from "sparse but legible" —
+    a tile holding a dozen 9pt callouts measures well under 1% and would be
+    discarded, losing the text silently. A single 9pt glyph is ~10^3 inked
+    pixels, so a floor of 100 skips only genuinely empty tiles.
+
     Args:
         tile_image: Grayscale tile image
         white_threshold: Pixel value considered white/blank
-        min_content_pct: Minimum content ratio (0.01 = 1%)
+        min_content_pixels: Minimum inked pixels required to OCR the tile
 
     Returns:
-        True if tile has content, False if mostly blank
+        True if tile has content, False if blank
     """
     # Apply Gaussian blur to reduce noise
     blurred = cv2.GaussianBlur(tile_image, (5, 5), 0)
@@ -525,12 +534,7 @@ def detect_tile_content(
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     mask = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    # Calculate content ratio
-    content_pixels = np.count_nonzero(mask)
-    total_pixels = mask.size
-    content_ratio = content_pixels / total_pixels
-
-    return content_ratio >= min_content_pct
+    return int(np.count_nonzero(mask)) >= min_content_pixels
 
 
 def process_single_tile(
@@ -540,7 +544,7 @@ def process_single_tile(
     zoom: float,
     ocr_config: HighResOCRConfig,
     skip_empty: bool,
-    min_content_pct: float,
+    min_content_pixels: int,
     white_threshold: int
 ) -> List[Dict[str, Any]]:
     """
@@ -553,7 +557,7 @@ def process_single_tile(
         zoom: Zoom factor
         ocr_config: OCR configuration (DPI, PSM, etc.)
         skip_empty: Skip if tile is blank
-        min_content_pct: Content threshold
+        min_content_pixels: Minimum inked pixels required to OCR the tile
         white_threshold: White pixel threshold
 
     Returns:
@@ -563,7 +567,7 @@ def process_single_tile(
     tile_img = render_tile(pdf_path, page_index, tile_bounds, zoom)
 
     # Check if tile has content
-    if skip_empty and not detect_tile_content(tile_img, white_threshold, min_content_pct):
+    if skip_empty and not detect_tile_content(tile_img, white_threshold, min_content_pixels):
         return []
 
     # Run OCR on tile
@@ -681,11 +685,12 @@ def tiled_ocr(
     lang: str = "eng",
     overlap_pct: float = 0.20,
     skip_empty: bool = True,
-    min_content_pct: float = 0.01,
+    min_content_pixels: int = 100,
     return_report: bool = False,
     use_dual_psm: bool = True,  # Try both PSM 11 and PSM 6 (Tesseract only)
     engine: str = "tesseract",  # OCR engine: "tesseract" or "easyocr"
-    use_gpu: bool = True        # Use GPU if available (EasyOCR only)
+    use_gpu: bool = True,       # Use GPU if available (EasyOCR only)
+    max_tile_pixels: int = 29000  # Max pixels per tile side
 ) -> List[Dict[str, Any]] | Tuple[List[Dict[str, Any]], TileOCRReport]:
     """
     Perform tiled OCR on a large PDF page.
@@ -699,7 +704,7 @@ def tiled_ocr(
         lang: OCR language ("eng" for Tesseract, "en" for EasyOCR)
         overlap_pct: Overlap between tiles (0.15-0.40 recommended)
         skip_empty: Skip tiles with minimal content
-        min_content_pct: Minimum content ratio to process tile
+        min_content_pixels: Minimum inked pixels required to OCR a tile
         return_report: Return diagnostic report with results
         use_dual_psm: If True, runs both PSM 11 and PSM 6, merges results (Tesseract only)
         engine: OCR engine to use ("tesseract" or "easyocr")
@@ -719,7 +724,11 @@ def tiled_ocr(
     doc.close()
 
     # Calculate tile grid
-    config = calculate_tile_grid(page_width, page_height, dpi, overlap_pct=overlap_pct)
+    config = calculate_tile_grid(
+        page_width, page_height, dpi,
+        max_tile_pixels=max_tile_pixels,
+        overlap_pct=overlap_pct,
+    )
 
     # Generate tile bounds
     zoom = dpi / 72.0
@@ -771,7 +780,7 @@ def tiled_ocr(
                 zoom=zoom,
                 ocr_config=ocr_config,
                 skip_empty=skip_empty,
-                min_content_pct=min_content_pct,
+                min_content_pixels=min_content_pixels,
                 white_threshold=config.white_threshold
             )
 
@@ -795,7 +804,7 @@ def tiled_ocr(
                     zoom=zoom,
                     ocr_config=ocr_config,
                     skip_empty=skip_empty,
-                    min_content_pct=min_content_pct,
+                    min_content_pixels=min_content_pixels,
                     white_threshold=config.white_threshold
                 )
 
@@ -842,6 +851,7 @@ def ocr_page(
     min_conf: int = 50,
     psm: int = 11,
     max_tile_pixels: int = 29000,
+    max_page_megapixels: float = 64.0,
     overlap_pct: float = 0.35,
 ) -> List[Dict]:
     """
@@ -851,6 +861,16 @@ def ocr_page(
     ocr-augment path use, so large engineering sheets never get rendered as one
     giant pixmap (which would blow past Tesseract's pixel limit / OOM). Pages
     that fit are OCR'd whole; larger ones are split via ``tiled_ocr``.
+
+    Two independent caps decide that:
+
+    * ``max_tile_pixels`` bounds a single *side*, keeping Tesseract under its
+      ~32767px hard limit. This is a correctness bound.
+    * ``max_page_megapixels`` bounds the *area*, which is what actually drives
+      memory. Every realistic engineering sheet is under the per-side cap yet
+      far over a sane memory budget — an ANSI E sheet at 600 DPI is
+      26400x20400 (539 MP) and would render whole. Without the area cap,
+      tiling effectively never fires on the documents this tool exists for.
 
     Returns a list of ``{"text": str, "bbox": (x0, y0, x1, y1)}`` in PDF coords.
     """
@@ -862,7 +882,16 @@ def ocr_page(
     doc.close()
 
     zoom = dpi / 72.0
-    needs_tiling = (page_w * zoom > max_tile_pixels) or (page_h * zoom > max_tile_pixels)
+    px_w, px_h = page_w * zoom, page_h * zoom
+    max_page_pixels = max_page_megapixels * 1_000_000
+    # Square tile side that satisfies the area budget, then take the stricter
+    # of it and the per-side limit so both constraints hold.
+    tile_side_cap = min(max_tile_pixels, int(math.sqrt(max_page_pixels)))
+    needs_tiling = (
+        px_w > tile_side_cap
+        or px_h > tile_side_cap
+        or px_w * px_h > max_page_pixels
+    )
 
     if needs_tiling:
         results = tiled_ocr(
@@ -876,6 +905,7 @@ def ocr_page(
             use_dual_psm=(eng == "tesseract"),
             engine=eng,
             use_gpu=gpu,
+            max_tile_pixels=tile_side_cap,
         )
         return [{"text": r["text"], "bbox": r["bbox"]} for r in results]
 
