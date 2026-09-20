@@ -2,114 +2,234 @@ from __future__ import annotations
 from typing import List, Dict, Optional, Tuple
 import os
 import sys
+import tempfile
 import fitz
 
 def _try_strip_layers_with_pikepdf(src_pdf: str) -> Optional[str]:
+    out_path = None
     try:
         import pikepdf
-        out_path = os.path.splitext(src_pdf)[0] + ".nolayers.pdf"
+        fd, out_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
         with pikepdf.open(src_pdf) as pdf:
-            if "/OCProperties" in pdf.root:
-                del pdf.root["/OCProperties"]
+            if "/OCProperties" in pdf.Root:
+                del pdf.Root["/OCProperties"]
             pdf.save(out_path, linearize=False)
         return out_path
     except Exception:
+        if out_path is not None:
+            os.unlink(out_path)
         return None
 
 def _draw_overlay_rects(page: fitz.Page, diff: Dict):
-    # geometry overlays (vector compare)
-    for x0, y0, x1, y1 in diff["geometry"]["added"]:
-        page.draw_rect(fitz.Rect(x0, y0, x1, y1),
-                       color=(0, 1, 0), fill=(0, 1, 0, 0.15), width=0.5)
-    for x0, y0, x1, y1 in diff["geometry"]["removed"]:
-        page.draw_rect(fitz.Rect(x0, y0, x1, y1),
-                       color=(1, 0, 0), fill=(1, 0, 0, 0.15), width=0.5)
+    # Raster and layout coordinates describe the rotated, displayed page;
+    # PyMuPDF drawing operations always take unrotated page coordinates.
+    def rect(box):
+        result = fitz.Rect(box)
+        if diff.get("coordinate_space") == "display":
+            result = result * page.derotation_matrix
+        return result
 
-    # changed regions (raster grid / raster fallback)
-    for x0, y0, x1, y1 in diff["geometry"].get("changed", []):
-        page.draw_rect(fitz.Rect(x0, y0, x1, y1),
-                       color=(0.5, 0.0, 0.8),
-                       fill=(0.5, 0.0, 0.8, 0.15),
-                       width=0.6)
+    for kind, color in (
+        ("added", (0, 1, 0)),
+        ("removed", (1, 0, 0)),
+        ("changed", (0.5, 0, 0.8)),
+    ):
+        for box in diff.get("geometry", {}).get(kind, []):
+            # Four-component fill tuples mean CMYK, not RGBA.
+            page.draw_rect(rect(box), color=color, fill=color,
+                           fill_opacity=0.15, width=0.6)
 
-    # text overlays
-    for t in diff["text"]["added"]:
-        x0, y0, x1, y1 = t["bbox"]
-        page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=(0, 1, 0), width=0.6)
-    for t in diff["text"]["removed"]:
-        x0, y0, x1, y1 = t["bbox"]
-        page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=(1, 0, 0), width=0.6)
-    for t in diff["text"]["moved"]:
-        x0, y0, x1, y1 = t["from"]
-        page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=(1, 0.5, 0), width=0.6)
-        x0, y0, x1, y1 = t["to"]
-        page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=(1, 0.5, 0), width=1.0, dashes=[2, 2])
+    text = diff.get("text", {})
+    for kind, color in (("added", (0, 1, 0)), ("removed", (1, 0, 0))):
+        for item in text.get(kind, []):
+            page.draw_rect(rect(item["bbox"]), color=color, width=0.6)
+    for item in text.get("moved", []):
+        page.draw_rect(rect(item["from"]), color=(1, 0.5, 0), width=0.6)
+        page.draw_rect(rect(item["to"]), color=(1, 0.5, 0),
+                       width=1.0, dashes="[2 2] 0")
 
-def _draw_legend(page: fitz.Page):
-    x, y, w, h = 36, 36, 200, 66
-    r = fitz.Rect(x, y, x+w, y+h)
-    page.draw_rect(r, color=(0,0,0), fill=(1,1,1,0.9), width=0.5)
-    page.insert_text((x+10, y+16), "Legend", fontsize=9, color=(0,0,0))
-    # swatches
-    def box(cx, cy, col):
-        page.draw_rect(fitz.Rect(cx, cy, cx+10, cy+10), fill=col, color=col, width=0.2)
-    box(x+10,  y+24, (0,1,0));        page.insert_text((x+26, y+33), "Added",   fontsize=8, color=(0,0,0))
-    box(x+70,  y+24, (1,0,0));        page.insert_text((x+86, y+33), "Removed", fontsize=8, color=(0,0,0))
-    box(x+130, y+24, (0.5,0.0,0.8));  page.insert_text((x+146,y+33), "Changed", fontsize=8, color=(0,0,0))
+    layout = diff.get("layout", {})
+    for kind, color in (("added", (0, 1, 0)), ("removed", (1, 0, 0))):
+        for item in layout.get(kind, []):
+            page.draw_rect(rect(item["bbox"]), color=color, fill=color,
+                           fill_opacity=0.1, width=0.8)
+    for kind, color, width in (
+        ("moved", (1, 0.5, 0), 1.8),
+        ("resized", (0.5, 0, 0.8), 0.8),
+        ("changed", (0.5, 0, 0.8), 0.8),
+    ):
+        for item in layout.get(kind, []):
+            # A block may move and resize together. The wider orange stroke
+            # stays visible around the narrower purple stroke in that case.
+            page.draw_rect(rect(item["from"]), color=color, width=width)
+            page.draw_rect(rect(item["to"]), color=color, width=width,
+                           dashes="[2 2] 0")
 
-def write_overlay(base_pdf_path: str, diffs: List[Dict], out_pdf_path: str):
-    # First attempt: draw directly on the original
+    if diff.get("layout_page_changed"):
+        bounds = page.rect + (2, 2, -2, -2)
+        page.draw_rect(bounds * page.derotation_matrix,
+                       color=(0.5, 0, 0.8), width=2)
+
+    status = diff.get("page_status")
+    if status in ("added", "removed"):
+        color = (0, 0.7, 0) if status == "added" else (1, 0, 0)
+        bounds = page.rect + (2, 2, -2, -2)
+        page.draw_rect(bounds * page.derotation_matrix, color=color, width=2)
+        page.insert_text(fitz.Point(12, page.rect.height - 12) * page.derotation_matrix,
+                         f"Page {status}", fontsize=10, color=color, rotate=page.rotation)
+
+def _legend_position(page: fitz.Page, width: float, height: float, margin: float):
+    """Find a blank displayed corner without obscuring content or highlights."""
+    zoom = min(1.0, 1200 / max(page.rect.width, page.rect.height))
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY,
+                         alpha=False)
+    pixels = pix.samples_mv
+    for x, y in (
+        (margin, margin),
+        (page.rect.width - margin - width, margin),
+        (page.rect.width - margin - width, page.rect.height - margin - height),
+        (margin, page.rect.height - margin - height),
+    ):
+        # Include the border and a little padding when checking for content.
+        bounds = fitz.Rect(x - 1, y - 1, x + width + 1, y + height + 1)
+        bounds = (bounds * fitz.Matrix(zoom, zoom)).irect
+        bounds &= fitz.IRect(0, 0, pix.width, pix.height)
+        if all(min(pixels[row * pix.stride + bounds.x0:row * pix.stride + bounds.x1],
+                   default=255) >= 250 for row in range(bounds.y0, bounds.y1)):
+            return x, y
+    return None
+
+
+def _draw_legend(page: fitz.Page, *, layout: bool = False):
+    purple_label = "Resized" if layout else "Changed"
+    height = 94 if layout else 66
+    margin = min(36, page.rect.width * 0.05, page.rect.height * 0.05)
+    scale = min(1.0, (page.rect.width - 2 * margin) / 200,
+                (page.rect.height - 2 * margin) / height)
+    origin = _legend_position(page, 200 * scale, height * scale, margin)
+    if origin is None:
+        # Dense drawings may have no room for a legend. Keep the explanation
+        # in a PDF comment instead of painting a large panel over the drawing.
+        display_rect = fitz.Rect(page.rect.width - 22, 2, page.rect.width - 4, 20)
+        note_rect = display_rect * page.derotation_matrix
+        description = ("Legend\nGreen: Added\nRed: Removed\n"
+                       f"Purple: {purple_label}\nOrange: Moved")
+        if layout:
+            description += ("\nSolid: Previous position/size\nDashed: New position/size"
+                            "\nPurple page border: Page size or rotation changed")
+        note = page.add_text_annot(note_rect.tl, description,
+                                  icon="Comment")
+        note.set_flags(note.flags & ~fitz.PDF_ANNOT_IS_NO_ROTATE)
+        note.set_rect(note_rect)
+        note.set_info(title="PDF comparison legend")
+        note.update()
+        return
+    origin_x, origin_y = origin
+
+    def point(x, y):
+        return fitz.Point(origin_x + x * scale, origin_y + y * scale) * page.derotation_matrix
+
+    def rectangle(x0, y0, x1, y1):
+        return fitz.Rect(origin_x + x0 * scale, origin_y + y0 * scale,
+                         origin_x + x1 * scale, origin_y + y1 * scale) * page.derotation_matrix
+
+    page.draw_rect(rectangle(0, 0, 200, height), color=(0, 0, 0),
+                   fill=(1, 1, 1), fill_opacity=0.9, width=0.5)
+    page.insert_text(point(10, 16), "Legend", fontsize=9 * scale,
+                     color=(0, 0, 0), rotate=page.rotation)
+    for x, y, label, color in (
+        (10, 24, "Added", (0, 1, 0)),
+        (104, 24, "Removed", (1, 0, 0)),
+        (10, 44, purple_label, (0.5, 0, 0.8)),
+        (104, 44, "Moved", (1, 0.5, 0)),
+    ):
+        page.draw_rect(rectangle(x, y, x + 10, y + 10),
+                       fill=color, color=color, width=0.2)
+        page.insert_text(point(x + 16, y + 9), label, fontsize=8 * scale,
+                         color=(0, 0, 0), rotate=page.rotation)
+    if layout:
+        for y, label in (
+            (70, "Solid: before   Dashed: after"),
+            (84, "Purple border: page size/rotation"),
+        ):
+            page.insert_text(point(10, y), label, fontsize=8 * scale,
+                             color=(0, 0, 0), rotate=page.rotation)
+
+
+def _append_missing_pages(doc: fitz.Document, diffs: List[Dict], alternate_pdf_path: Optional[str]):
+    last_page = max((d["page"] for d in diffs), default=0)
+    if last_page <= len(doc):
+        return
+    if alternate_pdf_path is None:
+        raise ValueError(f"Page {last_page} is missing from the base PDF; provide alternate_pdf_path")
+    with fitz.open(alternate_pdf_path) as alternate:
+        if last_page > len(alternate):
+            raise ValueError(f"Page {last_page} is missing from both comparison PDFs")
+        doc.insert_pdf(alternate, from_page=len(doc), to_page=last_page - 1)
+
+
+def _apply_overlays(doc: fitz.Document, diffs: List[Dict]):
+    for diff in diffs:
+        _draw_overlay_rects(doc[diff["page"] - 1], diff)
+    if diffs:
+        _draw_legend(doc[diffs[0]["page"] - 1],
+                     layout=any("layout" in diff for diff in diffs))
+
+
+def write_overlay(base_pdf_path: str, diffs: List[Dict], out_pdf_path: str,
+                  *, alternate_pdf_path: Optional[str] = None):
+    """Preserve the base PDF and highlight differences at their page numbers.
+
+    Missing trailing pages are copied from ``alternate_pdf_path``. Vector boxes
+    use unrotated coordinates; raster/layout diffs must set ``coordinate_space`` to
+    ``"display"``. Entire-page changes can set ``page_status`` to added/removed.
+    """
+    for diff in diffs:
+        if not isinstance(diff.get("page"), int) or diff["page"] < 1:
+            raise ValueError("Overlay page numbers must be positive integers")
+    output_path = os.path.normcase(os.path.realpath(out_pdf_path))
+    for source in (base_pdf_path, alternate_pdf_path):
+        if source and os.path.normcase(os.path.realpath(source)) == output_path:
+            raise ValueError("Overlay output must be different from the source PDFs")
+    os.makedirs(os.path.dirname(os.path.abspath(out_pdf_path)), exist_ok=True)
+
+    def write_vector(path):
+        with fitz.open(path) as doc:
+            _append_missing_pages(doc, diffs, alternate_pdf_path)
+            _apply_overlays(doc, diffs)
+            doc.save(out_pdf_path, deflate=True, clean=True)
+
     try:
-        doc = fitz.open(base_pdf_path)
-        if diffs:
-            _draw_legend(doc[diffs[0]["page"] - 1])
-        for d in diffs:
-            page = doc[d["page"] - 1]
-            _draw_overlay_rects(page, d)
-        doc.save(out_pdf_path, deflate=True, clean=True)
-        doc.close()
+        write_vector(base_pdf_path)
         return
     except RuntimeError:
-        # Close any partially opened doc
-        try: doc.close()
-        except Exception: pass
+        pass
 
-        # Second attempt: strip OCGs then draw
-        stripped = _try_strip_layers_with_pikepdf(base_pdf_path)
-        if stripped:
-            doc2 = fitz.open(stripped)
-            if diffs:
-                _draw_legend(doc2[diffs[0]["page"] - 1])
-            for d in diffs:
-                page = doc2[d["page"] - 1]
-                _draw_overlay_rects(page, d)
-            doc2.save(out_pdf_path, deflate=True, clean=True)
-            doc2.close()
+    stripped = _try_strip_layers_with_pikepdf(base_pdf_path)
+    if stripped:
+        try:
+            write_vector(stripped)
             return
+        except RuntimeError:
+            pass
+        finally:
+            os.unlink(stripped)
 
-        # Final fallback: rasterize background pages, then draw overlays
-        base = fitz.open(base_pdf_path)
-        out = fitz.open()
-        for idx, d in enumerate(diffs):
-            src_pg = base[d["page"] - 1]
-            # crisper fallback background (~216 DPI)
-            mat = fitz.Matrix(3, 3)
-            pix = src_pg.get_pixmap(matrix=mat, alpha=False)
-
-            # new page same size as source
-            new_pg = out.new_page(width=src_pg.rect.width, height=src_pg.rect.height)
-            new_pg.insert_image(src_pg.rect, pixmap=pix)
-
-            # optional legend on first output page
-            if idx == 0:
-                _draw_legend(new_pg)
-
-            _draw_overlay_rects(new_pg, d)
-
+    # Preserve every page and its rotation even when a vector save fails.
+    with fitz.open(base_pdf_path) as base, fitz.open() as out:
+        _append_missing_pages(base, diffs, alternate_pdf_path)
+        for src_pg in base:
+            rotation = src_pg.rotation
+            src_pg.set_rotation(0)
+            bounds = src_pg.rect
+            zoom = min(3.0, 4000 / max(bounds.width, bounds.height))
+            pix = src_pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            new_pg = out.new_page(width=bounds.width, height=bounds.height)
+            new_pg.insert_image(new_pg.rect, pixmap=pix)
+            new_pg.set_rotation(rotation)
+        _apply_overlays(out, diffs)
         out.save(out_pdf_path, deflate=True)
-        out.close()
-        base.close()
-        return
 
 
 def create_searchable_pdf(

@@ -991,7 +991,9 @@ class TableExtractor:
         zoom = _capped_dpi(page.rect.width, page.rect.height, self.config.dpi, self.config.max_render_pixels) / 72.0
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        # Zero-copy view; `samples` would double the render's memory. `pix` stays
+        # alive for the rest of this function, and nothing writes to `image`.
+        image = np.frombuffer(pix.samples_mv, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
         doc.close()
 
         if len(image.shape) == 3:
@@ -1093,7 +1095,7 @@ class TableExtractor:
             x0, y0, x1, y1 = table_bbox
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat, clip=fitz.Rect(x0, y0, x1, y1), alpha=False)
-            image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+            image = np.frombuffer(pix.samples_mv, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
             # Offset is the region's top-left in full-page pixel space, so the
             # downstream `(offset + cell_px) / zoom` mapping yields PDF coords.
             offset_x, offset_y = int(x0 * zoom), int(y0 * zoom)
@@ -1101,7 +1103,7 @@ class TableExtractor:
             zoom = _capped_dpi(page.rect.width, page.rect.height, self.config.dpi, self.config.max_render_pixels) / 72.0
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat, alpha=False)
-            image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+            image = np.frombuffer(pix.samples_mv, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
             offset_x, offset_y = 0, 0
             table_bbox = (0, 0, pix.w / zoom, pix.h / zoom)
 

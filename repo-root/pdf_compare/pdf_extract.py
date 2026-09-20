@@ -1,8 +1,11 @@
 # pdf_compare/pdf_extract.py
 from __future__ import annotations
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from .worker_pool import (
     configure_thread_env,
@@ -59,17 +62,13 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
                 bbox = tuple(span["bbox"])  # type: ignore
                 runs.append({"text": txt, "bbox": bbox, "font": span.get("font"), "size": span.get("size"), "source": "native"})
 
-    # Debug logging for OCR decision
     if enable_ocr:
-        import sys
-        print(f"OCR: page {page_index+1 if page_index is not None else '?'}: Found {len(runs)} native text spans (threshold: 20)", file=sys.stderr)
-        if len(runs) >= 20:
-            print(f"OCR: page {page_index+1}: Skipping OCR (sufficient native text found)", file=sys.stderr)
+        logger.debug("OCR page %s: %d native text spans (threshold 20)",
+                     page_index + 1 if page_index is not None else "?", len(runs))
 
     # Run OCR if enabled and little native text was found
     if enable_ocr and len(runs) < 20 and pdf_path and page_index is not None:
         try:
-            import sys
             from .analyzers.highres_ocr import ocr_page
 
             # ocr_page resolves the engine/GPU (UI choice > env > CUDA autodetect,
@@ -84,7 +83,7 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
                 min_conf=50,
                 psm=11,
             )
-            print(f"OCR: page {page_index+1}: {len(ocr_results)} text item(s)", file=sys.stderr)
+            logger.debug("OCR page %s: %d text item(s)", page_index + 1, len(ocr_results))
 
             # Add OCR results to runs
             for ocr_text in ocr_results:
@@ -96,12 +95,10 @@ def _extract_text(page: "fitz.Page", pdf_path: Optional[str] = None, page_index:
                     "source": "ocr"
                 })
 
-        except Exception as e:
-            # Log OCR errors but don't break extraction
-            import sys
-            import traceback
-            print(f"OCR warning for page {page_index}: {e}", file=sys.stderr)
-            print(f"OCR traceback: {traceback.format_exc()}", file=sys.stderr)
+        except Exception:
+            # Don't break extraction, but make the failure visible (S4): previously
+            # this was a silent stderr print, so an OCR failure looked like "no text".
+            logger.error("OCR failed for page %s of %s", page_index + 1, pdf_path, exc_info=True)
 
     return runs
 
@@ -166,6 +163,7 @@ def pdf_to_vectormap(
     ocr_dpi: int = 400,                       # DPI for OCR rendering (tiled OCR splits oversized pages)
     ocr_engine: Optional[str] = None,         # "easyocr"|"tesseract"; None=auto (env/CUDA)
     ocr_use_gpu: Optional[bool] = None,       # None=auto (CUDA autodetect for EasyOCR)
+    progress_callback: Optional[Callable[[int, int], None]] = None,  # (done, total) per page
 ) -> VectorMap:
     """
     Parallel, high-throughput ingest.
@@ -175,6 +173,7 @@ def pdf_to_vectormap(
     - bezier_samples: sampling density for cubic curves
     - simplify_tolerance: if set, simplifies strokes to reduce oversampled paths
     - enable_ocr: if True, runs OCR on pages with minimal native text
+    - progress_callback: optional callback(completed_pages, total_pages) for UI feedback
     """
     p = Path(path)
     if not p.exists():
@@ -210,12 +209,8 @@ def pdf_to_vectormap(
     )
 
     # Log worker allocation
-    import sys
-    if enable_ocr:
-        ocr_mode = f" (OCR enabled, DPI will be auto-adjusted per page)"
-    else:
-        ocr_mode = ""
-    print(f"Processing {page_count} page(s) with {workers} worker(s){ocr_mode}", file=sys.stderr)
+    logger.info("Processing %d page(s) with %d worker(s)%s",
+                page_count, workers, " (OCR enabled)" if enable_ocr else "")
 
     # Map pages in parallel (Windows-safe spawn context)
     page_dicts: List[Dict[str, Any]] = []
@@ -236,6 +231,8 @@ def pdf_to_vectormap(
                     ocr_use_gpu=ocr_use_gpu,
                 )
             )
+            if progress_callback:
+                progress_callback(i + 1, page_count)
     else:
         # Use ThrottledPoolExecutor for memory-bounded parallel processing
         with ThrottledPoolExecutor(max_workers=workers, initializer=worker_init) as pool:
@@ -257,7 +254,7 @@ def pdf_to_vectormap(
             page_dicts = pool.submit_throttled(
                 worker_func=_extract_page_job,
                 items=range(page_count),
-                progress_callback=None,  # No callback for client mode
+                progress_callback=progress_callback,
                 item_to_args=item_to_args,
             )
 
